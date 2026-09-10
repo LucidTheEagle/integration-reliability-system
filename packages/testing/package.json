@@ -1,0 +1,11 @@
+{
+    "name": "@irs/testing",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Shared testing utilities, fixtures, factories, and helpers for the Integration Reliability System.",
+    "type": "module",
+    "scripts": {
+      "build": "tsc -p tsconfig.json",
+      "typecheck": "tsc -p tsconfig.json --noEmit"
+    }
+  }

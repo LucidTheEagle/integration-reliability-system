@@ -1,0 +1,11 @@
+{
+    "name": "@irs/db",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Database access layer for the Integration Reliability System.",
+    "type": "module",
+    "scripts": {
+      "build": "tsc -p tsconfig.json",
+      "typecheck": "tsc -p tsconfig.json --noEmit"
+    }
+  }

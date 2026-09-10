@@ -1,18 +1,22 @@
 {
-    "name": "integration-reliability-system",
-    "version": "1.0.0",
-    "private": true,
-    "description": "Integration Reliability System — resilient business-system integration, recovery, reconciliation, and operational observability",
-    "scripts": {
-      "build": "pnpm -r --if-present run build",
-      "dev": "pnpm -r --if-present run dev",
-      "test": "pnpm -r --if-present run test",
-      "lint": "pnpm -r --if-present run lint",
-      "typecheck": "pnpm -r --if-present run typecheck"
-    },
-    "engines": {
-      "node": ">=20.0.0",
-      "pnpm": ">=9.0.0"
-    },
-    "packageManager": "pnpm@9.0.0"
+  "name": "integration-reliability-system",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Integration Reliability System — resilient business-system integration, recovery, reconciliation, and operational observability",
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "dev": "pnpm -r --if-present run dev",
+    "test": "pnpm -r --if-present run test",
+    "lint": "pnpm -r --if-present run lint",
+    "typecheck": "pnpm -r --if-present run typecheck"
+  },
+  "engines": {
+    "node": ">=24 <25",
+    "pnpm": ">=9 <10"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "devDependencies": {
+    "@types/node": "^24.13.4",
+    "typescript": "5.9.2"
   }
+}

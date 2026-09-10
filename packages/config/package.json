@@ -1,0 +1,11 @@
+{
+    "name": "@irs/config",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Validated runtime configuration for the Integration Reliability System.",
+    "type": "module",
+    "scripts": {
+      "build": "tsc -p tsconfig.json",
+      "typecheck": "tsc -p tsconfig.json --noEmit"
+    }
+  }

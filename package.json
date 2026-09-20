@@ -8,7 +8,8 @@
     "dev": "pnpm -r --if-present run dev",
     "test": "pnpm -r --if-present run test",
     "lint": "pnpm -r --if-present run lint",
-    "typecheck": "pnpm -r --if-present run typecheck"
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "prisma:validate": "prisma validate"
   },
   "engines": {
     "node": ">=24 <25",
@@ -17,6 +18,8 @@
   "packageManager": "pnpm@9.0.0",
   "devDependencies": {
     "@types/node": "^24.13.4",
+    "dotenv": "18.0.1",
+    "prisma": "7.10.0",
     "typescript": "5.9.2"
   }
 }

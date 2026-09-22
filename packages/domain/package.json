@@ -1,11 +1,20 @@
 {
-    "name": "@irs/domain",
-    "version": "1.0.0",
-    "private": true,
-    "description": "Core domain types and business rules for the Integration Reliability System.",
-    "type": "module",
-    "scripts": {
-      "build": "tsc -p tsconfig.json",
-      "typecheck": "tsc -p tsconfig.json --noEmit"
+  "name": "@irs/domain",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Core domain types and business rules for the Integration Reliability System.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test \"dist/**/*.test.js\""
   }
+}

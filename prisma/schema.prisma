@@ -6,3 +6,371 @@ generator client {
   provider = "prisma-client"
   output   = "../packages/db/src/generated/prisma"
 }
+
+enum EventState {
+  RECEIVED
+  VALIDATED
+  QUEUED
+  PROCESSING
+  SUCCEEDED
+  RETRYING
+  FAILED
+  UNKNOWN
+  REJECTED
+  DUPLICATE
+}
+
+enum OperationState {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  RETRYING
+  FAILED
+  UNKNOWN
+}
+
+enum ReconciliationRunState {
+  PENDING
+  RUNNING
+  COMPLETED
+}
+
+enum DiscrepancyState {
+  DETECTED
+  CLASSIFIED
+  AUTO_RESOLVING
+  RESOLVED
+  MANUAL_REVIEW
+  UNRESOLVED
+}
+
+enum IncidentState {
+  OPEN
+  RESOLVED
+  CLOSED
+}
+
+enum IntegrationConfigState {
+  DRAFT
+  ACTIVE
+  DISABLED
+  DECOMMISSIONED
+}
+
+enum IntegrationHealth {
+  HEALTHY
+  DEGRADED
+  FAILING
+  AUTHENTICATION_ERROR
+  OFFLINE
+}
+
+enum FailureClass {
+  TRANSIENT
+  RATE_LIMITED
+  AUTHENTICATION
+  AUTHORIZATION
+  VALIDATION
+  NOT_FOUND
+  CONFLICT
+  AMBIGUOUS
+  DATA_INTEGRITY
+  SECURITY
+  INTERNAL
+  UNKNOWN
+}
+
+enum RecoveryAction {
+  RETRY
+  RECONCILE
+  ESCALATE
+}
+
+model Integration {
+  id           String                 @id @default(uuid(7)) @db.Uuid
+  name         String
+  provider     String
+  type         String
+  configStatus IntegrationConfigState
+  health       IntegrationHealth?
+  environment  String
+  createdAt    DateTime               @default(now())
+  updatedAt    DateTime               @updatedAt
+
+  endpoints                  IntegrationEndpoint[]
+  credentials                Credential[]
+  events                     Event[]
+  systemResources            SystemResource[]
+  incidents                  Incident[]
+  syncRelationshipsAsSource  SyncRelationship[]    @relation("SyncRelationshipSource")
+  syncRelationshipsAsTarget  SyncRelationship[]    @relation("SyncRelationshipTarget")
+  reconciliationRunsAsSource ReconciliationRun[]   @relation("ReconciliationRunSource")
+  reconciliationRunsAsTarget ReconciliationRun[]   @relation("ReconciliationRunTarget")
+
+  @@index([configStatus])
+  @@index([health])
+}
+
+model IntegrationEndpoint {
+  id            String   @id @default(uuid(7)) @db.Uuid
+  integrationId String   @db.Uuid
+  name          String
+  method        String
+  path          String
+  operationType String
+  enabled       Boolean  @default(true)
+  retryPolicyId String?  @db.Uuid
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  integration Integration  @relation(fields: [integrationId], references: [id], onDelete: Restrict)
+  retryPolicy RetryPolicy? @relation(fields: [retryPolicyId], references: [id], onDelete: Restrict)
+  operations  Operation[]
+
+  @@unique([integrationId, method, path])
+  @@index([retryPolicyId])
+}
+
+model Credential {
+  id              String    @id @default(uuid(7)) @db.Uuid
+  integrationId   String    @db.Uuid
+  type            String
+  status          String
+  expiresAt       DateTime?
+  lastRefreshedAt DateTime?
+
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Restrict)
+
+  @@index([integrationId])
+}
+
+model RetryPolicy {
+  id                String   @id @default(uuid(7)) @db.Uuid
+  name              String
+  maxAttempts       Int      @default(4)
+  backoffStrategy   String   @default("exponential")
+  baseDelayMs       Int      @default(1000)
+  maxDelayMs        Int      @default(30000)
+  jitter            Boolean  @default(true)
+  respectRetryAfter Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  endpoints IntegrationEndpoint[]
+}
+
+model Event {
+  id              String     @id @default(uuid(7)) @db.Uuid
+  integrationId   String     @db.Uuid
+  externalEventId String
+  eventType       String
+  resourceType    String
+  resourceId      String
+  payload         Json
+  metadata        Json?
+  occurredAt      DateTime
+  receivedAt      DateTime   @default(now())
+  status          EventState
+  schemaVersion   String
+  correlationId   String?
+
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Restrict)
+  operations  Operation[]
+
+  @@unique([integrationId, externalEventId])
+  @@index([status])
+  @@index([receivedAt])
+}
+
+// INVARIANT (application-layer, not database-enforced): an Operation's
+// event.integrationId and endpoint.integrationId must be equal. Prisma has
+// no cross-table CHECK constraint, so this is not automatically guaranteed
+// by removing the redundant integrationId column below -- it must be
+// verified by whatever code creates an Operation (see D-014).
+model Operation {
+  id             String         @id @default(uuid(7)) @db.Uuid
+  eventId        String         @db.Uuid
+  endpointId     String         @db.Uuid
+  operationType  String
+  resourceType   String
+  resourceId     String
+  idempotencyKey String
+  status         OperationState
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  event    Event               @relation(fields: [eventId], references: [id], onDelete: Restrict)
+  endpoint IntegrationEndpoint @relation(fields: [endpointId], references: [id], onDelete: Restrict)
+  attempts ProcessingAttempt[]
+
+  // One Event can legitimately fan out to multiple Operations against
+  // different endpoints (e.g. fulfillment + CRM + notification side
+  // effects from one payment event) -- scoped by endpoint, not just event,
+  // so those distinct side effects don't collide on the same key.
+  @@unique([eventId, endpointId, idempotencyKey])
+  @@index([endpointId])
+  @@index([status])
+}
+
+// status is deliberately String, not OperationState. Valid values for an
+// attempt are exactly:
+//   PROCESSING | SUCCEEDED | FAILED | UNKNOWN
+// PENDING does not apply: this row's existence (startedAt is set at
+// creation) means it has already begun. RETRYING does not apply to a
+// single attempt: it describes the PARENT Operation's decision to create
+// ANOTHER attempt after this one concludes, never a state this same
+// attempt transitions into. Operation owns the broader lifecycle
+// (including RETRYING); this model records one execution's own outcome.
+model ProcessingAttempt {
+  id               String          @id @default(uuid(7)) @db.Uuid
+  operationId      String          @db.Uuid
+  attemptNumber    Int
+  status           String
+  startedAt        DateTime        @default(now())
+  completedAt      DateTime?
+  durationMs       Int?
+  failureCategory  FailureClass?
+  recoveryAction   RecoveryAction?
+  errorCode        String?
+  errorMessage     String?
+  httpStatus       Int?
+  responseMetadata Json?
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Restrict)
+
+  @@unique([operationId, attemptNumber])
+  @@index([status])
+  @@index([failureCategory])
+}
+
+model SystemResource {
+  id            String   @id @default(uuid(7)) @db.Uuid
+  integrationId String   @db.Uuid
+  resourceType  String
+  externalId    String
+  displayLabel  String?
+  metadata      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Restrict)
+
+  @@unique([integrationId, resourceType, externalId])
+}
+
+model SyncRelationship {
+  id                  String    @id @default(uuid(7)) @db.Uuid
+  sourceIntegrationId String    @db.Uuid
+  sourceResourceType  String
+  sourceResourceId    String
+  targetIntegrationId String    @db.Uuid
+  targetResourceType  String
+  targetResourceId    String
+  status              String
+  lastSyncedAt        DateTime?
+  createdAt           DateTime  @default(now())
+
+  sourceIntegration Integration @relation("SyncRelationshipSource", fields: [sourceIntegrationId], references: [id], onDelete: Restrict)
+  targetIntegration Integration @relation("SyncRelationshipTarget", fields: [targetIntegrationId], references: [id], onDelete: Restrict)
+
+  @@unique([sourceIntegrationId, sourceResourceType, sourceResourceId, targetIntegrationId, targetResourceType, targetResourceId])
+  @@index([targetIntegrationId])
+}
+
+// createdAt = row enters PENDING. startedAt = actual PENDING -> RUNNING
+// transition (nullable; unset until a worker actually begins). completedAt
+// = actual completion (nullable; unset until finished).
+model ReconciliationRun {
+  id                  String                 @id @default(uuid(7)) @db.Uuid
+  sourceIntegrationId String                 @db.Uuid
+  targetIntegrationId String                 @db.Uuid
+  resourceType        String
+  scope               String
+  status              ReconciliationRunState
+  createdAt           DateTime               @default(now())
+  startedAt           DateTime?
+  completedAt         DateTime?
+  itemsChecked        Int                    @default(0)
+  itemsMatched        Int                    @default(0)
+  itemsMismatched     Int                    @default(0)
+
+  sourceIntegration Integration   @relation("ReconciliationRunSource", fields: [sourceIntegrationId], references: [id], onDelete: Restrict)
+  targetIntegration Integration   @relation("ReconciliationRunTarget", fields: [targetIntegrationId], references: [id], onDelete: Restrict)
+  discrepancies     Discrepancy[]
+
+  @@index([sourceIntegrationId])
+  @@index([targetIntegrationId])
+  @@index([status])
+}
+
+model Discrepancy {
+  id                  String           @id @default(uuid(7)) @db.Uuid
+  reconciliationRunId String           @db.Uuid
+  resourceType        String
+  resourceId          String
+  sourceState         Json
+  targetState         Json
+  difference          Json
+  severity            String
+  status              DiscrepancyState
+  resolutionType      String?
+  resolutionNotes     String?
+  detectedAt          DateTime         @default(now())
+  resolvedAt          DateTime?
+
+  reconciliationRun ReconciliationRun @relation(fields: [reconciliationRunId], references: [id], onDelete: Restrict)
+
+  @@index([reconciliationRunId])
+  @@index([status])
+}
+
+model Incident {
+  id            String        @id @default(uuid(7)) @db.Uuid
+  integrationId String        @db.Uuid
+  type          String
+  severity      String
+  status        IncidentState
+  title         String
+  description   String?
+  detectedAt    DateTime      @default(now())
+  resolvedAt    DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  integration     Integration      @relation(fields: [integrationId], references: [id], onDelete: Restrict)
+  operatorActions OperatorAction[]
+
+  @@index([integrationId])
+  @@index([status])
+}
+
+model OperatorAction {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  incidentId String?  @db.Uuid
+  actorId    String
+  actionType String
+  targetType String
+  targetId   String
+  reason     String?
+  result     String?
+  createdAt  DateTime @default(now())
+
+  incident Incident? @relation(fields: [incidentId], references: [id], onDelete: Restrict)
+
+  @@index([incidentId])
+  @@index([targetType, targetId])
+}
+
+model AuditEntry {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  actorType  String
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}

@@ -9,13 +9,20 @@
  */
 
 export {
-    EventState,
-    OperationState,
-    ReconciliationRunState,
-    DiscrepancyState,
-    IncidentState,
-    IntegrationConfigState,
-    IntegrationHealth,
-    FailureClass,
-    RecoveryAction,
-  } from "./enums.js";
+  EventState,
+  OperationState,
+  ReconciliationRunState,
+  DiscrepancyState,
+  IncidentState,
+  IntegrationConfigState,
+  IntegrationHealth,
+  FailureClass,
+  RecoveryAction,
+} from "./enums.js";
+
+export {
+  EVENT_STATE_TRANSITIONS,
+  canTransitionEventState,
+  assertEventStateTransition,
+  IllegalEventStateTransitionError,
+} from "./event-state-machine.js";

@@ -26,3 +26,10 @@ export {
   assertEventStateTransition,
   IllegalEventStateTransitionError,
 } from "./event-state-machine.js";
+
+export type { RetryPolicy } from "./retry-policy.js";
+export {
+  createRetryPolicy,
+  DEFAULT_RETRY_POLICY,
+  InvalidRetryPolicyError,
+} from "./retry-policy.js";

@@ -37,7 +37,11 @@ importers:
 
   packages/domain: {}
 
-  packages/integrations: {}
+  packages/integrations:
+    dependencies:
+      '@irs/domain':
+        specifier: workspace:^
+        version: link:../domain
 
   packages/testing: {}
 

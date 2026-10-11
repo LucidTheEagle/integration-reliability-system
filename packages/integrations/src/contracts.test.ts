@@ -65,7 +65,7 @@ type _n1 = Expect<Equal<keyof SendNotificationCapability, "sendNotification">>;
 
 // @ts-expect-error — there is deliberately no universal adapter interface
 import type { IntegrationAdapter } from "./index.js";
-// @ts-expect-error — Task 009 defines no PaymentEvent; inbound payment-event contracts are decided with Task 010
+// @ts-expect-error — no PaymentEvent is defined; Task 010 verifies a provider-neutral webhook envelope and adds no payment-event contract
 import type { PaymentEvent } from "./index.js";
 
 // @ts-expect-error — failureClass is required
@@ -109,8 +109,9 @@ const _notACreator: CreateCustomerCapability = readOnlyCrm;
 // Runtime tests (only where there is runtime behavior to check).
 // ---------------------------------------------------------------------
 describe("@irs/integrations public entry point", () => {
-  it("is types only: exports nothing at runtime (no factory, registry, base class, or framework)", () => {
-    assert.deepEqual(Object.keys(publicApi), []);
+  it("exposes exactly one runtime export, verifyIrsV1Webhook (no factory, registry, base class, or framework)", () => {
+    assert.deepEqual(Object.keys(publicApi), ["verifyIrsV1Webhook"]);
+    assert.equal(typeof publicApi.verifyIrsV1Webhook, "function");
   });
 });
 

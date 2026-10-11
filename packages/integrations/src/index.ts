@@ -38,3 +38,13 @@ export type {
     SendNotificationCapability,
     SendNotificationInput,
   } from "./notification.js";
+
+  export { verifyIrsV1Webhook } from "./webhook/verify-webhook.js";
+
+  export type {
+    VerifiedWebhookEnvelope,
+    VerifyIrsV1WebhookInput,
+    VerifyIrsV1WebhookResult,
+    WebhookRejection,
+    WebhookRejectionReason,
+  } from "./webhook/verify-webhook.js";

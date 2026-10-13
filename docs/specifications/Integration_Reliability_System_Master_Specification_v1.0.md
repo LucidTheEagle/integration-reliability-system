@@ -15,21 +15,22 @@ Purpose: the authoritative specification used to guide research, architecture, i
 
 # Document Control
 
-| **Field**                          | **Value**                                             |
-|------------------------------------|-------------------------------------------------------|
-| Product                            | Integration Reliability System                        |
-| Working client scenario            | Northstar Commerce (fictional)                        |
-| Document role                      | Authoritative product and technical baseline          |
-| Owner                              | Founder / System Architect                            |
-| Implementation model               | Human-led, AI-assisted                                |
-| Primary code assistant             | Claude                                                |
-| Independent reviewer               | Gemini                                                |
-| Architecture/research partner      | ChatGPT                                               |
-| Actual coding environment          | Cursor / VS Code                                      |
-| Source of truth for implementation | Git repository                                        |
-| Status                             | Architecture baseline; implementation not yet started |
-| Version                            | 1.0                                                   |
-| Last updated                       | September 2026                                        |
+| **Field**                          | **Value**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+|------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Product                            | Integration Reliability System                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Working client scenario            | Northstar Commerce (fictional)                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Document role                      | Authoritative product and technical baseline                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Owner                              | Founder / System Architect                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Implementation model               | Human-led, AI-assisted                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Primary code assistant             | Claude                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Independent reviewer               | Gemini                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Architecture/research partner      | ChatGPT                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Actual coding environment          | Cursor / VS Code                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Source of truth for implementation | Git repository                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Status                             | Architecture baseline; implementation in progress. Task 010 is incorporated into local main; Task 010A implementation is underway in its dedicated worktree and awaits final review and integration into main.                                                                                                                                                                                                                                                                               |
+| Version                            | 1.0                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Last updated                       | October 2026                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). |
 
 # How This Document Is Used
 
@@ -435,18 +436,18 @@ For this portfolio project, microservices would create service-to-service failur
 
 # 8. Technology Baseline
 
-| **Area**             | **Baseline**       | **Reason**                                                    |
-|----------------------|--------------------|---------------------------------------------------------------|
-| Language             | TypeScript         | Strong type safety across web/API/worker/shared packages.     |
-| Web                  | Next.js            | Suitable operations-console UI.                               |
-| HTTP API             | Fastify (proposal) | Schema-oriented, TypeScript-friendly API boundary.            |
-| Database             | PostgreSQL         | Durable relational source of truth.                           |
-| ORM                  | Prisma             | Efficient schema/migration workflow for a solo engineer.      |
-| Validation           | Zod (proposal)     | Runtime input validation with TypeScript inference.           |
-| Queue                | BullMQ             | Node-native retries, delayed jobs, backoff and deduplication. |
-| Queue store          | Redis              | BullMQ backend for background job state.                      |
-| Infrastructure local | Docker Compose     | Reproducible PostgreSQL/Redis environment.                    |
-| Package manager      | pnpm               | Simple workspace/monorepo support.                            |
+| **Area**             | **Baseline**                     | **Reason**                                                           |
+|----------------------|----------------------------------|----------------------------------------------------------------------|
+| Language             | TypeScript                       | Strong type safety across web/API/worker/shared packages.            |
+| Web                  | Next.js                          | Suitable operations-console UI.                                      |
+| HTTP API             | Fastify 5.12.5 (accepted, D-015) | Schema-oriented, TypeScript-friendly API boundary. Used by apps/api. |
+| Database             | PostgreSQL                       | Durable relational source of truth.                                  |
+| ORM                  | Prisma                           | Efficient schema/migration workflow for a solo engineer.             |
+| Validation           | Zod (proposal)                   | Runtime input validation with TypeScript inference.                  |
+| Queue                | BullMQ                           | Node-native retries, delayed jobs, backoff and deduplication.        |
+| Queue store          | Redis                            | BullMQ backend for background job state.                             |
+| Infrastructure local | Docker Compose                   | Reproducible PostgreSQL/Redis environment.                           |
+| Package manager      | pnpm                             | Simple workspace/monorepo support.                                   |
 
 Items explicitly marked proposal are not architectural facts until accepted during the repository-foundation pass.
 
@@ -537,6 +538,26 @@ Webhook senders often expect a fast acknowledgement. GitHub documentation recomm
 13. The raw payload and safe metadata are persisted for investigation, subject to payload-size and sensitive-data rules.
 
 14. The webhook path must not wait for multiple external API operations.
+
+## Transport boundary (Task 010A)
+
+Task 010A establishes the HTTP transport boundary for POST /api/webhooks/:integrationKey in apps/api (Fastify 5.12.5, D-015). It covers the Identify integration and Verify signature stages of the flow above and the handoff to ingestion; the later stages remain with Task 011. The boundary must satisfy the following:
+
+- The API preserves the exact incoming request bytes and enforces a bounded body size. The bytes are passed to the verifier unmodified and are never re-serialized.
+
+- The Task 010 verifier remains the sole cryptographic authority. The transport boundary performs no signature comparison, timestamp check, or envelope validation of its own, and nothing in the request is trusted until the verifier succeeds.
+
+- A request with a missing IRS-Signature header receives a generic 401 response before the request body is consumed. All other verification, including signature comparison, remains with the Task 010 verifier.
+
+- The integrationKey is the Integration.id: only canonical lowercase UUIDs, of any version, are accepted (D-016). The webhook secret is looked up in the initial IRS_WEBHOOK_SECRETS configuration, which is keyed by the same Integration.id (D-017). An identifier without a configured secret fails closed.
+
+- The ingestion handoff is injectable and carries the original request bytes and the verified envelope.
+
+- The production handoff returns HTTP 503 until Task 011 provides durable acceptance. No successful HTTP acknowledgement is sent before durable acceptance is established.
+
+- Raw-byte storage and duplicate-delivery semantics (including the response to a duplicate delivery) remain decisions for Task 011 and are not made by Task 010A.
+
+- Durable recording of rejected webhooks (Task 011A) and endpoint rate limiting (Task 011B) are separate tasks and are not delivered by Task 010A.
 
 ## Security constraint
 
@@ -829,6 +850,16 @@ The persistent operational timeline should tell the story of what happened witho
 
 Credential metadata may be persisted; secret material should be kept in environment/secrets infrastructure appropriate to the deployment. No secrets in Git, logs, screenshots, or portfolio case studies.
 
+## Initial webhook-secret mechanism
+
+Per D-017, webhook secrets are initially supplied through environment-backed configuration (IRS_WEBHOOK_SECRETS), keyed by Integration.id. The variable is a comma-separated list of integration-uuid=hex-secret entries: each key is a canonical lowercase UUID of any version (the Integration.id) and each secret is lowercase hexadecimal of even length that decodes to at least 32 bytes (at least 64 hexadecimal characters). Malformed entries and duplicate integration IDs are rejected, and an absent or empty variable configures no integrations, so every webhook then fails closed. This mechanism is limited to local development, demonstrations, and controlled mock-provider use; it is not a production secret-management design. Secret-store selection and secret rotation remain open follow-up requirements.
+
+## Security-audit recording and rate limiting
+
+- Rejected webhook deliveries must be recorded durably as security-audit evidence, consistent with the EVENT_REJECTED audit event (Section 17) and the Rejected and recorded failure-test expectation (Section 19). Structured application logging is not a substitute for a durable audit record. This requirement is planned as Task 011A and is not implemented by Task 010A.
+
+- Rate limiting on the webhook endpoint remains an explicit requirement. It is planned as Task 011B and is not implemented by Task 010A.
+
 ## Operations console
 
 V1 roles: OPERATOR and ADMIN. OPERATOR can investigate and perform allowed recovery actions. ADMIN can configure integrations and credentials.
@@ -974,23 +1005,35 @@ The initial README should explain the problem, architecture at a glance, prerequ
 
 # 22. Build Phases
 
-| **Phase**                  | **Outcome**                                                               |
-|----------------------------|---------------------------------------------------------------------------|
-| 0 — Repository foundation  | Workspace, tooling, Docker infrastructure, docs baseline.                 |
-| 1 — Persistence foundation | Prisma schema, migrations, constraints, indexes.                          |
-| 2 — Domain foundation      | States, failure taxonomy, retry policy, idempotency rules.                |
-| 3 — Webhook ingestion      | Signature verification, validation, persistence, duplicate handling.      |
-| 4 — Worker processing      | BullMQ worker, operations, attempts, failure classification.              |
-| 5 — Integration adapters   | CRM, payment, fulfillment, notification mock integrations.                |
-| 6 — Reliability            | Retries, ambiguity, rate limits, auth refresh, health, failure injection. |
-| 7 — Reconciliation         | Relationships, comparison rules, discrepancies, resolution.               |
-| 8 — Operations console     | Dashboard, events, integrations, incidents, reconciliation controls.      |
-| 9 — Security & testing     | Auth, authorization, redaction, unit/integration/e2e/failure tests.       |
-| 10 — Portfolio hardening   | Deployment, reproducible demos, metrics, documentation, case study.       |
+| **Phase**                  | **Outcome**                                                                                                   |
+|----------------------------|---------------------------------------------------------------------------------------------------------------|
+| 0 — Repository foundation  | Workspace, tooling, Docker infrastructure, docs baseline.                                                     |
+| 1 — Persistence foundation | Prisma schema, migrations, constraints, indexes.                                                              |
+| 2 — Domain foundation      | States, failure taxonomy, retry policy, idempotency rules.                                                    |
+| 3 — Webhook ingestion      | Signature verification, validation, persistence, duplicate handling, security-audit recording, rate limiting. |
+| 4 — Worker processing      | BullMQ worker, operations, attempts, failure classification.                                                  |
+| 5 — Integration adapters   | CRM, payment, fulfillment, notification mock integrations.                                                    |
+| 6 — Reliability            | Retries, ambiguity, rate limits, auth refresh, health, failure injection.                                     |
+| 7 — Reconciliation         | Relationships, comparison rules, discrepancies, resolution.                                                   |
+| 8 — Operations console     | Dashboard, events, integrations, incidents, reconciliation controls.                                          |
+| 9 — Security & testing     | Auth, authorization, redaction, unit/integration/e2e/failure tests.                                           |
+| 10 — Portfolio hardening   | Deployment, reproducible demos, metrics, documentation, case study.                                           |
 
 ## Build rule
 
 Do not start the next phase merely because the previous phase has code. A phase advances when its acceptance criteria are met and the behavior is verified.
+
+## Phase 3 acceptance criteria
+
+Phase 3 — Webhook ingestion cannot be declared complete until all of the following are implemented and verified:
+
+- Durable event ingestion and duplicate handling (Task 011).
+
+- Durable recording of rejected webhooks as security-audit evidence (Task 011A).
+
+- Webhook endpoint rate limiting (Task 011B).
+
+Task 010A (transport boundary and fail-closed ingestion handoff) does not by itself satisfy any of these criteria.
 
 # 23. AI-Assisted Engineering Protocol
 
@@ -1110,63 +1153,73 @@ This is the standard skeleton. Each actual task prompt will be written specifica
 
 # 25. Initial Claude Task Queue
 
-| **Task ID** | **Task**                  | **Purpose**                          | **Dependency** |
-|-------------|---------------------------|--------------------------------------|----------------|
-| 001         | Repository bootstrap      | Create monorepo skeleton and tooling | None           |
-| 002         | Docker infrastructure     | PostgreSQL + Redis local services    | 001            |
-| 003         | Configuration foundation  | Typed environment/config handling    | 001            |
-| 004         | Prisma initialization     | Database client/migration foundation | 002            |
-| 005         | Domain enums              | Shared status/failure types          | 001            |
-| 006         | Initial schema            | Core configuration/event entities    | 004,005        |
-| 007         | Event state machine       | Protect legal state transitions      | 005            |
-| 008         | Retry policy model        | Represent bounded retry behavior     | 005            |
-| 009         | Adapter contracts         | Define provider capability boundary  | 001            |
-| 010         | Webhook verification      | Secure inbound webhook boundary      | 006,009        |
-| 011         | Durable event ingestion   | Persist accepted events              | 006,010        |
-| 012         | Queue dispatch            | Schedule background processing       | 002,011        |
-| 013         | Worker foundation         | Consume jobs safely                  | 012            |
-| 014         | Processing attempts       | Persist execution history            | 006,013        |
-| 015         | Failure classifier        | Canonical recovery classification    | 005,014        |
-| 016         | Retry engine              | Implement bounded retries/backoff    | 008,015        |
-| 017         | Mock CRM                  | External system simulation           | 009            |
-| 018         | Mock payment provider     | Events + lookup simulation           | 009            |
-| 019         | Mock fulfillment provider | Idempotent create + failures         | 009            |
-| 020         | Failure injection         | Deterministic provider faults        | 017–019        |
+| **Task ID** | **Task**                                    | **Purpose**                                                                                                                                                                                                                                                                               | **Dependency**  |
+|-------------|---------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------|
+| 001         | Repository bootstrap                        | Create monorepo skeleton and tooling                                                                                                                                                                                                                                                      | None            |
+| 002         | Docker infrastructure                       | PostgreSQL + Redis local services                                                                                                                                                                                                                                                         | 001             |
+| 003         | Configuration foundation                    | Typed environment/config handling                                                                                                                                                                                                                                                         | 001             |
+| 004         | Prisma initialization                       | Database client/migration foundation                                                                                                                                                                                                                                                      | 002             |
+| 005         | Domain enums                                | Shared status/failure types                                                                                                                                                                                                                                                               | 001             |
+| 006         | Initial schema                              | Core configuration/event entities                                                                                                                                                                                                                                                         | 004,005         |
+| 007         | Event state machine                         | Protect legal state transitions                                                                                                                                                                                                                                                           | 005             |
+| 008         | Retry policy model                          | Represent bounded retry behavior                                                                                                                                                                                                                                                          | 005             |
+| 009         | Adapter contracts                           | Define provider capability boundary                                                                                                                                                                                                                                                       | 001             |
+| 010         | Webhook verification                        | Secure inbound webhook boundary                                                                                                                                                                                                                                                           | 006,009         |
+| 010A        | API foundation & webhook transport boundary | Fastify API foundation and POST /api/webhooks/:integrationKey: bounded raw-body handling, secrets from IRS_WEBHOOK_SECRETS keyed by Integration.id, Task 010 verification, and an injectable ingestion handoff that fails closed with HTTP 503 until Task 011 provides durable acceptance | 001,003,009,010 |
+| 011         | Durable event ingestion                     | Persist accepted events                                                                                                                                                                                                                                                                   | 006,010A        |
+| 011A        | Webhook security audit recording            | Durable recording of rejected webhooks per the specification's security and audit requirements                                                                                                                                                                                            | 010A,011        |
+| 011B        | Webhook endpoint rate limiting              | Bound the volume of requests reaching the webhook endpoint                                                                                                                                                                                                                                | 010A            |
+| 012         | Queue dispatch                              | Schedule background processing                                                                                                                                                                                                                                                            | 002,011         |
+| 013         | Worker foundation                           | Consume jobs safely                                                                                                                                                                                                                                                                       | 012             |
+| 014         | Processing attempts                         | Persist execution history                                                                                                                                                                                                                                                                 | 006,013         |
+| 015         | Failure classifier                          | Canonical recovery classification                                                                                                                                                                                                                                                         | 005,014         |
+| 016         | Retry engine                                | Implement bounded retries/backoff                                                                                                                                                                                                                                                         | 008,015         |
+| 017         | Mock CRM                                    | External system simulation                                                                                                                                                                                                                                                                | 009             |
+| 018         | Mock payment provider                       | Events + lookup simulation                                                                                                                                                                                                                                                                | 009             |
+| 019         | Mock fulfillment provider                   | Idempotent create + failures                                                                                                                                                                                                                                                              | 009             |
+| 020         | Failure injection                           | Deterministic provider faults                                                                                                                                                                                                                                                             | 017–019         |
 
 This queue is intentionally a roadmap, not a mandate to execute all tasks without review. We will generate the exact Claude handoff for each task only after the previous task is verified.
 
+Task 010A delivers only the transport boundary and a fail-closed ingestion handoff; durable rejection recording (Task 011A) and rate limiting (Task 011B) are separate tasks outside its scope. The Task 011A audit contract must be designed and approved before Task 011 is approved for implementation, and the Task 011B design must be approved before the Task 011A design is approved.
+
 # 26. Decision Register
 
-| **ID** | **Decision**                                                            | **Status** | **Notes**                                    |
-|--------|-------------------------------------------------------------------------|------------|----------------------------------------------|
-| D-001  | Product name = Integration Reliability System                           | ACCEPTED   | Locked                                       |
-| D-002  | IRS is a reliability/orchestration layer, not business system of record | ACCEPTED   | Locked                                       |
-| D-003  | Northstar Commerce is the fictional demonstration scenario              | ACCEPTED   | Synthetic                                    |
-| D-004  | Modular monolith + dedicated worker                                     | ACCEPTED   | V1 architecture                              |
-| D-005  | PostgreSQL is durable source of truth                                   | ACCEPTED   | Domain/operational state                     |
-| D-006  | Redis/BullMQ handles background job transport/scheduling                | ACCEPTED   | Not source of truth                          |
-| D-007  | Adapter pattern isolates provider-specific integration code             | ACCEPTED   | Capabilities over vendor leakage             |
-| D-008  | Idempotency is required at inbound and processing levels                | ACCEPTED   | Remote support where available               |
-| D-009  | Ambiguous outcomes require verification/reconciliation                  | ACCEPTED   | No blind retry                               |
-| D-010  | Reconciliation is first-class                                           | ACCEPTED   | Explicit rules                               |
-| D-011  | AI is not core V1                                                       | ACCEPTED   | Reliability first                            |
-| D-012  | n8n is not core Product 1                                               | ACCEPTED   | Reserved for Product 2                       |
-| D-013  | Supabase is not core Product 1                                          | ACCEPTED   | Avoid abstraction of intended infrastructure |
+| **ID** | **Decision**                                                                                                                                                                         | **Status** | **Notes**                                                                                                     |
+|--------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------|---------------------------------------------------------------------------------------------------------------|
+| D-001  | Product name = Integration Reliability System                                                                                                                                        | ACCEPTED   | Locked                                                                                                        |
+| D-002  | IRS is a reliability/orchestration layer, not business system of record                                                                                                              | ACCEPTED   | Locked                                                                                                        |
+| D-003  | Northstar Commerce is the fictional demonstration scenario                                                                                                                           | ACCEPTED   | Synthetic                                                                                                     |
+| D-004  | Modular monolith + dedicated worker                                                                                                                                                  | ACCEPTED   | V1 architecture                                                                                               |
+| D-005  | PostgreSQL is durable source of truth                                                                                                                                                | ACCEPTED   | Domain/operational state                                                                                      |
+| D-006  | Redis/BullMQ handles background job transport/scheduling                                                                                                                             | ACCEPTED   | Not source of truth                                                                                           |
+| D-007  | Adapter pattern isolates provider-specific integration code                                                                                                                          | ACCEPTED   | Capabilities over vendor leakage                                                                              |
+| D-008  | Idempotency is required at inbound and processing levels                                                                                                                             | ACCEPTED   | Remote support where available                                                                                |
+| D-009  | Ambiguous outcomes require verification/reconciliation                                                                                                                               | ACCEPTED   | No blind retry                                                                                                |
+| D-010  | Reconciliation is first-class                                                                                                                                                        | ACCEPTED   | Explicit rules                                                                                                |
+| D-011  | AI is not core V1                                                                                                                                                                    | ACCEPTED   | Reliability first                                                                                             |
+| D-012  | n8n is not core Product 1                                                                                                                                                            | ACCEPTED   | Reserved for Product 2                                                                                        |
+| D-013  | Supabase is not core Product 1                                                                                                                                                       | ACCEPTED   | Avoid abstraction of intended infrastructure                                                                  |
+| D-015  | HTTP API framework for apps/api = Fastify 5.12.5                                                                                                                                     | ACCEPTED   | Resolves O-001; first used by Task 010A                                                                       |
+| D-016  | Webhook route key :integrationKey is the Integration.id; canonical lowercase UUIDs of any version are accepted; no new key or slug column is introduced                              | ACCEPTED   | Task 010A; an identifier without a configured secret fails closed                                             |
+| D-017  | Initial webhook secrets are environment-backed (IRS_WEBHOOK_SECRETS: comma-separated integration-uuid=hex-secret entries; lowercase hex, at least 32 bytes), keyed by Integration.id | ACCEPTED   | Local development, demonstrations and mock providers only; secret store and rotation remain open (Section 18) |
+
+Unresolved reference: prisma/schema.prisma refers to decision D-014 (Operation event/endpoint integration consistency check). No D-014 entry exists in this register, and its content cannot presently be reconstructed from this specification or the available repository history; the ID is reserved and must not be reused or assigned by inference. Related discrepancy: Section 13 lists integrationId on Operation, but the current schema has no such column. No design is changed by this note; reconciliation is assigned to a future schema/domain task, to be identified when that task is scoped.
 
 ## Open questions
 
-| **ID** | **Question**                            | **Decision point**           |
-|--------|-----------------------------------------|------------------------------|
-| O-001  | Fastify vs alternative HTTP framework   | Repository foundation review |
-| O-002  | Exact Prisma field types/indexes        | Schema task                  |
-| O-003  | Exact authentication/session library    | Security implementation      |
-| O-004  | Exact retry jitter formula              | Retry task                   |
-| O-005  | Exact integration-health thresholds     | Reliability phase            |
-| O-006  | Exact reconciliation rules per resource | Reconciliation phase         |
-| O-007  | Event ordering/version semantics        | Domain/task review           |
-| O-008  | Deployment platform                     | Portfolio hardening          |
-| O-009  | Retention/archival policy               | Operational hardening        |
-| O-010  | Exact portfolio benchmark workload      | Testing/metrics phase        |
+| **ID** | **Question**                                                               | **Decision point**           |
+|--------|----------------------------------------------------------------------------|------------------------------|
+| O-001  | Fastify vs alternative HTTP framework — RESOLVED by D-015 (Fastify 5.12.5) | Repository foundation review |
+| O-002  | Exact Prisma field types/indexes                                           | Schema task                  |
+| O-003  | Exact authentication/session library                                       | Security implementation      |
+| O-004  | Exact retry jitter formula                                                 | Retry task                   |
+| O-005  | Exact integration-health thresholds                                        | Reliability phase            |
+| O-006  | Exact reconciliation rules per resource                                    | Reconciliation phase         |
+| O-007  | Event ordering/version semantics                                           | Domain/task review           |
+| O-008  | Deployment platform                                                        | Portfolio hardening          |
+| O-009  | Retention/archival policy                                                  | Operational hardening        |
+| O-010  | Exact portfolio benchmark workload                                         | Testing/metrics phase        |
 
 # 27. Portfolio Demonstration Plan
 

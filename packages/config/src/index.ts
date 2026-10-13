@@ -167,3 +167,99 @@ export function loadConfig(
     }),
   });
 }
+
+// ---------------------------------------------------------------------------
+// Webhook secrets (Task 010A, decision D-017)
+// ---------------------------------------------------------------------------
+
+const WEBHOOK_SECRETS_VARIABLE = "IRS_WEBHOOK_SECRETS";
+
+/** Minimum secret length accepted by the Task 010 verifier. */
+const MIN_WEBHOOK_SECRET_BYTES = 32;
+const MIN_WEBHOOK_SECRET_HEX_CHARS = MIN_WEBHOOK_SECRET_BYTES * 2;
+
+/** Canonical lowercase UUID text of any version (8-4-4-4-12 lowercase hex). */
+const CANONICAL_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+const LOWERCASE_HEX_PATTERN = /^[0-9a-f]+$/;
+
+/**
+ * Webhook secrets keyed by `Integration.id` (canonical lowercase UUID).
+ * Values are the exact secret bytes handed to the Task 010 verifier. Treat
+ * the map and its values as read-only.
+ */
+export type WebhookSecrets = ReadonlyMap<string, Uint8Array>;
+
+/**
+ * Loads the initial environment-backed webhook secrets.
+ *
+ * `IRS_WEBHOOK_SECRETS` is a comma-separated list of
+ * `<integration-uuid>=<hex-secret>` entries:
+ *
+ * - the key is a canonical lowercase UUID (any version): `Integration.id`;
+ * - the secret is lowercase hexadecimal of even length and at least 64
+ *   characters, and is decoded to the secret bytes (at least 32 bytes);
+ * - no whitespace, empty entries, or duplicate integration IDs are allowed.
+ *
+ * An absent or empty variable yields an empty map (no integration can then
+ * be authenticated, so every webhook fails closed).
+ *
+ * This mechanism is limited to local development, demonstrations, and
+ * controlled mock-provider use (Master Specification, Section 18). It does
+ * not perform any database lookup.
+ *
+ * Error messages identify the variable and the 1-based entry index only;
+ * they never contain a secret, a key, or any part of the raw value.
+ *
+ * @throws {ConfigValidationError} if any entry is invalid.
+ */
+export function loadWebhookSecrets(
+  source: NodeJS.ProcessEnv = process.env,
+): WebhookSecrets {
+  const raw = source[WEBHOOK_SECRETS_VARIABLE];
+  const secrets = new Map<string, Uint8Array>();
+  if (raw === undefined || raw.length === 0) {
+    return secrets;
+  }
+
+  const fail = (entryNumber: number, reason: string): never => {
+    throw new ConfigValidationError([
+      `${WEBHOOK_SECRETS_VARIABLE}: entry ${entryNumber}: ${reason}`,
+    ]);
+  };
+
+  const entries = raw.split(",");
+  entries.forEach((entry, index) => {
+    const entryNumber = index + 1;
+    const parts = entry.split("=");
+    if (parts.length !== 2) {
+      return fail(entryNumber, "must be <integration-uuid>=<hex-secret>");
+    }
+    const [integrationId, secretHex] = parts as [string, string];
+
+    if (!CANONICAL_UUID_PATTERN.test(integrationId)) {
+      return fail(entryNumber, "integration ID must be a canonical lowercase UUID");
+    }
+    if (!LOWERCASE_HEX_PATTERN.test(secretHex)) {
+      return fail(entryNumber, "secret must be lowercase hexadecimal");
+    }
+    if (secretHex.length % 2 !== 0) {
+      return fail(entryNumber, "secret must have an even number of hex characters");
+    }
+    if (secretHex.length < MIN_WEBHOOK_SECRET_HEX_CHARS) {
+      return fail(
+        entryNumber,
+        `secret must be at least ${MIN_WEBHOOK_SECRET_BYTES} bytes (${MIN_WEBHOOK_SECRET_HEX_CHARS} hex characters)`,
+      );
+    }
+    if (secrets.has(integrationId)) {
+      return fail(entryNumber, "duplicate integration ID");
+    }
+
+    secrets.set(integrationId, new Uint8Array(Buffer.from(secretHex, "hex")));
+    return undefined;
+  });
+
+  return secrets;
+}

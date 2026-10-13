@@ -30,7 +30,7 @@ Purpose: the authoritative specification used to guide research, architecture, i
 | Status                             | Architecture baseline; implementation in progress. Tasks 010 and 010A are implemented, committed and integrated into local main. Phase 3 (Webhook ingestion) remains in progress until the acceptance criteria for Task 011, Task 011A and Task 011B are satisfied.                                                                                                                                                                                                                          |
 | Version                            | 1.0                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Last updated                       | October 2026                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). |
+| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). 2026-10-13: Task 011B webhook rate-limiting design approved (Section 10 "Webhook rate limiting (Task 011B)"; D-018, D-019, D-020; O-011 added); fixed API error-code set recorded (Section 16); Sections 17, 18 and 19 updated accordingly. Version designation unchanged (V1.0). |
 
 # How This Document Is Used
 
@@ -503,11 +503,15 @@ Mock providers should allow controlled, repeatable faults such as 'next two requ
 > ↓\
 > POST /api/webhooks/:integrationKey\
 > ↓\
+> Peer rate limit (Task 011B: L1 requests, L2 rejection allowance)\
+> ↓\
 > Identify integration\
 > ↓\
 > Verify signature\
 > ↓\
 > Validate envelope\
+> ↓\
+> Integration rate limit (Task 011B: L3)\
 > ↓\
 > Check duplicate identity\
 > ↓\
@@ -558,6 +562,32 @@ Task 010A establishes the HTTP transport boundary for POST /api/webhooks/:integr
 - Raw-byte storage and duplicate-delivery semantics (including the response to a duplicate delivery) remain decisions for Task 011 and are not made by Task 010A.
 
 - Durable recording of rejected webhooks (Task 011A) and endpoint rate limiting (Task 011B) are separate tasks and are not delivered by Task 010A.
+
+## Webhook rate limiting (Task 011B)
+
+Task 011B bounds the volume of requests reaching POST /api/webhooks/:integrationKey with a process-local token-bucket limiter in apps/api (D-018). It requires no new dependency and no external store. The limiter must satisfy the following:
+
+- Layer 1 limits all requests per network peer before any route processing.
+
+- Layer 2 limits the number of individually delivered rejections (HTTP 400, 401, 404, 413 and 415) per network peer. Valid requests do not consume this allowance. While a peer's allowance holds less than one unit, every request from that peer, including an otherwise valid signed request, receives the rate-limit response before signature verification until the allowance refills. Peers that share a network address therefore share this allowance, and a sender that repeatedly causes rejections can keep a shared address blocked. This behaviour is a development policy and must be reassessed before public exposure (O-011).
+
+- Layer 3 limits deliveries per Integration.id after the Task 010 verifier has accepted the signature, timestamp, payload and envelope, and before the ingestion handoff. No per-integration limit is applied, and no per-integration entry is created, before signature verification.
+
+- The network peer is the directly connected socket address, with IPv4-mapped IPv6 addresses normalized and IPv6 addresses grouped by /64 prefix. Forwarding headers are never trusted; trusted-proxy client-address derivation requires a separate decision before public exposure (O-011).
+
+- A Layer 2 rejection allowance is consumed synchronously before the rejection is sent. A rejection for which no allowance is available is sent as the rate-limit response instead. Rate-limit responses never consume Layer 2 allowance.
+
+- A rate-limited request receives HTTP 429 with the generic error body and the fixed code TOO_MANY_REQUESTS (D-019), a Retry-After header in whole seconds, and Connection: close. No rate-limit quota headers are sent. No response, status or header is written to a connection that has already been destroyed.
+
+- A limiter fault produces the generic HTTP 500 response.
+
+- Every limiter table, including the per-integration table, has a fixed key capacity. When a table is full, new keys share one overflow bucket that is no more permissive than an individual key's bucket; keys sharing an overflow bucket contend for it, and active buckets are never evicted.
+
+- Requests rejected by the Node.js HTTP layer before the application observes them (malformed HTTP, header and request-framing errors, header and request timeouts) are outside all application-level rate-limit guarantees and counters. Connection-level protection for them is required before public exposure (O-011).
+
+- Initial limits are provisional development defaults. Layer 3 limits, key capacity and overflow behaviour must be re-evaluated after Task 011 throughput measurements; all limits must be re-evaluated before public deployment.
+
+- Rate-limit evidence is produced as bounded aggregate summaries with sequence coverage for Task 011A (Section 17). Counters that have not yet been durably recorded are lost if the process terminates abnormally; such gaps must be recorded explicitly and never estimated.
 
 ## Security constraint
 
@@ -789,11 +819,15 @@ Destructive or side-effecting controls should be explicit. The UI must distingui
 
 This is a contract map, not a final OpenAPI specification. Request/response shapes will be defined as implementation tasks reach the relevant boundary.
 
+Error responses from apps/api use a generic flat body {"error": <code>, "requestId": <server-generated request ID>} with a closed set of fixed codes: BAD_REQUEST (400), UNAUTHORIZED (401), NOT_FOUND (404), REQUEST_TIMEOUT (408), PAYLOAD_TOO_LARGE (413), UNSUPPORTED_MEDIA_TYPE (415), TOO_MANY_REQUESTS (429), INTERNAL_ERROR (500) and SERVICE_UNAVAILABLE (503) (D-019). Responses generated by the Node.js HTTP layer before the application observes a request are outside this contract and outside all application-level rate-limit guarantees and counters (O-011).
+
 # 17. Observability & Audit
 
 ## Structured logging
 
 Important technical operations should use structured logs containing timestamp, level, eventId, operationId, attemptId, integrationId, correlationId, message, and safe metadata.
+
+Raw client network addresses are not logged by default. Rate-limit events contain only the limiting layer, the request ID and a process-scoped keyed fingerprint of the normalized peer key (D-020).
 
 ## Correlation
 
@@ -834,6 +868,8 @@ The persistent operational timeline should tell the story of what happened witho
 
 - OPERATOR_ACTION
 
+Webhook requests rejected with HTTP 429 are not recorded as individual EVENT_REJECTED entries. They are recorded as bounded aggregate summaries that identify the limiter instance and the sequence range they cover. Missing coverage, including coverage lost through abnormal process termination, is recorded explicitly as an evidence gap without estimated counts. Evidence records are immutable once a write is attempted and are persisted transactionally or idempotently. Event names and persistence are defined by Task 011A.
+
 # 18. Security Model
 
 ## Webhook security
@@ -858,7 +894,7 @@ Per D-017, webhook secrets are initially supplied through environment-backed con
 
 - Rejected webhook deliveries must be recorded durably as security-audit evidence, consistent with the EVENT_REJECTED audit event (Section 17) and the Rejected and recorded failure-test expectation (Section 19). Structured application logging is not a substitute for a durable audit record. This requirement is planned as Task 011A and is not implemented by Task 010A.
 
-- Rate limiting on the webhook endpoint remains an explicit requirement. It is planned as Task 011B and is not implemented by Task 010A.
+- Rate limiting on the webhook endpoint is specified in Section 10 ("Webhook rate limiting (Task 011B)") and by D-018 to D-020. Rejections converted to HTTP 429 because a peer's rejection allowance is exhausted, and all other rate-limited requests, are evidenced through aggregate summaries rather than individual rejection records. Task 011A must record those summaries durably and must record evidence gaps without inventing counts.
 
 ## Operations console
 
@@ -866,7 +902,7 @@ V1 roles: OPERATOR and ADMIN. OPERATOR can investigate and perform allowed recov
 
 ## Logging hygiene
 
-Sensitive values must be redacted. Raw authorization headers, tokens, webhook secrets, cookies, and similar sensitive data must never be logged.
+Sensitive values must be redacted. Raw authorization headers, tokens, webhook secrets, cookies, and similar sensitive data must never be logged. Raw client network addresses must not be logged by default; source-address logging at a trusted network edge requires a separate decision (D-020).
 
 ## Security decisions that must be verified during implementation
 
@@ -876,7 +912,9 @@ Sensitive values must be redacted. Raw authorization headers, tokens, webhook se
 
 - CSRF considerations if cookie-based sessions are used.
 
-- Rate limiting on operator and webhook endpoints.
+- Rate limiting on webhook endpoints (Task 011B; Section 10) and on operator endpoints (deferred until those endpoints exist).
+
+- Connection-level protection, trusted-proxy client-address derivation (including reassessment of the shared Layer 2 rejection allowance), and handling of Node.js-level malformed-HTTP, framing and timeout responses, which are outside all application-level rate-limit guarantees and counters, before any public exposure (O-011).
 
 - Input size limits.
 
@@ -923,6 +961,7 @@ Sensitive values must be redacted. Raw authorization headers, tokens, webhook se
 | 403                              | No endless retry                                                              |
 | Malformed payload                | Rejected safely                                                               |
 | Invalid signature                | Rejected and recorded                                                         |
+| Webhook request flood            | Generic 429 with Retry-After before body processing; aggregate rate-limit evidence recorded |
 | Timeout after remote side effect | UNKNOWN then verify/reconcile, not blind duplicate create                     |
 | Retry exhaustion                 | FAILED state + operator path                                                  |
 | Manual replay                    | History preserved; new processing attempt recorded                            |
@@ -1203,6 +1242,9 @@ Task 010A delivers only the transport boundary and a fail-closed ingestion hando
 | D-015  | HTTP API framework for apps/api = Fastify 5.12.5                                                                                                                                     | ACCEPTED   | Resolves O-001; first used by Task 010A                                                                       |
 | D-016  | Webhook route key :integrationKey is the Integration.id; canonical lowercase UUIDs of any version are accepted; no new key or slug column is introduced                              | ACCEPTED   | Task 010A; an identifier without a configured secret fails closed                                             |
 | D-017  | Initial webhook secrets are environment-backed (IRS_WEBHOOK_SECRETS: comma-separated integration-uuid=hex-secret entries; lowercase hex, at least 32 bytes), keyed by Integration.id | ACCEPTED   | Local development, demonstrations and mock providers only; secret store and rotation remain open (Section 18) |
+| D-018  | Webhook rate limiting (Task 011B) uses a custom in-process token-bucket limiter in apps/api with three layers: L1 per-peer requests; L2 per-peer individual-rejection allowance, consumed synchronously before a rejection is sent, otherwise converted to 429, and denying all requests from a peer whose allowance is exhausted before verification; L3 per-Integration.id deliveries accepted by the Task 010 verifier, before the ingestion handoff. Every table has a fixed key capacity with a shared overflow bucket. No new dependency, no Redis, no trusted forwarding headers. | ACCEPTED | Limits provisional; L3 limits, capacity and overflow re-evaluated after Task 011 measurements; all limits and the shared-address Layer 2 risk re-evaluated before public exposure (O-011) |
+| D-019  | The fixed API error-code set adds TOO_MANY_REQUESTS (HTTP 429): generic flat body with server request ID, Retry-After, Connection: close, no rate-limit quota headers | ACCEPTED | Task 011B |
+| D-020  | Client network addresses are not logged by default; rate-limit log events carry a process-scoped keyed fingerprint of the normalized peer key | ACCEPTED | Edge source-address logging requires a separate decision |
 
 Unresolved reference: prisma/schema.prisma refers to decision D-014 (Operation event/endpoint integration consistency check). No D-014 entry exists in this register, and its content cannot presently be reconstructed from this specification or the available repository history; the ID is reserved and must not be reused or assigned by inference. Related discrepancy: Section 13 lists integrationId on Operation, but the current schema has no such column. No design is changed by this note; reconciliation is assigned to a future schema/domain task, to be identified when that task is scoped.
 
@@ -1220,6 +1262,7 @@ Unresolved reference: prisma/schema.prisma refers to decision D-014 (Operation e
 | O-008  | Deployment platform                                                        | Portfolio hardening          |
 | O-009  | Retention/archival policy                                                  | Operational hardening        |
 | O-010  | Exact portfolio benchmark workload                                         | Testing/metrics phase        |
+| O-011  | Connection-level protection, trusted-proxy client-address derivation (including reassessment of the shared Layer 2 rejection allowance), and handling of Node.js-level malformed-HTTP, framing and timeout events, which are outside all application-level rate-limit guarantees and counters and use non-flat response bodies | Deployment (with O-008); must be resolved before public exposure |
 
 # 27. Portfolio Demonstration Plan
 

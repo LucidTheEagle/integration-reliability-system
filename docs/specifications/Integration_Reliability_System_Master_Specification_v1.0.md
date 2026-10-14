@@ -30,7 +30,7 @@ Purpose: the authoritative specification used to guide research, architecture, i
 | Status                             | Architecture baseline; implementation in progress. Tasks 010 and 010A are implemented, committed and integrated into local main. Phase 3 (Webhook ingestion) remains in progress until the acceptance criteria for Task 011, Task 011A and Task 011B are satisfied.                                                                                                                                                                                                                          |
 | Version                            | 1.0                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Last updated                       | October 2026                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). 2026-10-13: Task 011B webhook rate-limiting design approved (Section 10 "Webhook rate limiting (Task 011B)"; D-018, D-019, D-020; O-011 added); fixed API error-code set recorded (Section 16); Sections 17, 18 and 19 updated accordingly. Version designation unchanged (V1.0). |
+| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). 2026-10-13: Task 011B webhook rate-limiting design approved (Section 10 "Webhook rate limiting (Task 011B)"; D-018, D-019, D-020; O-011 added); fixed API error-code set recorded (Section 16); Sections 17, 18 and 19 updated accordingly. Version designation unchanged (V1.0). 2026-10-14: Task 011A webhook security-audit and rate-limit evidence design approved (Section 13 RateLimitEvidence; Section 17 "Webhook rejection and rate-limit evidence (Task 011A)"; D-021, D-022, D-023; O-012 added); Sections 18 and 19 updated accordingly. Version designation unchanged (V1.0). |
 
 # How This Document Is Used
 
@@ -680,6 +680,9 @@ The following schema is the current design proposal and will be validated before
 | Incident            | id, integrationId, type, severity, status, title, description, detectedAt, resolvedAt, createdAt, updatedAt                                                 |
 | OperatorAction      | id, incidentId, actorId, actionType, targetType, targetId, reason, result, createdAt                                                                        |
 | AuditEntry          | id, actorType, actorId, action, entityType, entityId, metadata, createdAt                                                                                   |
+| RateLimitEvidence   | id, limiterInstanceId, scope, kind, gapReason, firstSequence, lastSequence, missingFrom, missingTo, payload, recordSha256, recordedAt                       |
+
+Rejected webhook deliveries are recorded as AuditEntry rows with action EVENT_REJECTED whose id equals the server-generated request ID, so that retries are idempotent. RateLimitEvidence holds rate-limit and rejection-audit aggregate summaries, evidence gaps and limiter-instance lifecycle records; its natural keys are enforced by unique indexes and overlapping summary ranges are rejected (D-021, D-022).
 
 ## Deliberate non-entities for V1
 
@@ -870,6 +873,24 @@ The persistent operational timeline should tell the story of what happened witho
 
 Webhook requests rejected with HTTP 429 are not recorded as individual EVENT_REJECTED entries. They are recorded as bounded aggregate summaries that identify the limiter instance and the sequence range they cover. Missing coverage, including coverage lost through abnormal process termination, is recorded explicitly as an evidence gap without estimated counts. Evidence records are immutable once a write is attempted and are persisted transactionally or idempotently. Event names and persistence are defined by Task 011A.
 
+## Webhook rejection and rate-limit evidence (Task 011A)
+
+- Only webhook requests whose rejection consumed a Layer 2 rejection allowance (Section 10) are eligible for an individual EVENT_REJECTED record. Rate-limited requests, successful deliveries and server-side failures are never recorded as individual rejections.
+
+- An individual record is an AuditEntry row whose structural fields are fixed: its identifier and entity identifier equal the server-generated request ID, the action is EVENT_REJECTED, the entity type is WEBHOOK_DELIVERY, the actor type is EXTERNAL_SENDER with no actor identifier, and the creation time is the time the record was admitted. Its metadata contains only these allowlisted fields: schema version; limiter-instance identifier; receipt time; rejection stage; HTTP status; fixed error code; canonical integration identifier, when one was validated; the verifier's fixed rejection reason, when applicable; and the observed response-completion state. "Finish observed" means the server observed its response finish event and is not proof that the client received the response; "close before finish" means the connection closed before that event and does not prove that no response bytes reached the client. Request bodies, signatures, secrets, headers, cookies, query strings, raw path parameters, raw client network addresses and peer fingerprints are never recorded.
+
+- Individual records are submitted after the server observes its response finish event or a connection close that precedes it. Audit recording never changes a webhook response or a rate-limit decision.
+
+- A global write ceiling and a bounded queue limit individual audit writes. Every rejection that is suppressed, dropped, in conflict, or still unconfirmed when shutdown retries stop is counted exactly in memory; unconfirmed records are reported separately as not attempted or of unknown outcome, never as lost or persisted. These counts become durable only when an aggregate summary containing them is persisted; counts accumulated after the last durable summary cannot be recovered after an abnormal termination.
+
+- Aggregate summaries carry rate-limit and rejection-audit counters for the same limiter instance and sequence range. Each evidence record is frozen before its first write attempt and persisted transactionally or idempotently; an existing record satisfies a write only if the complete record, not only its payload, is identical. Conflicting content is a fault and is never overwritten.
+
+- The API registers its limiter instance durably, after recording evidence gaps for previously unclosed instances, and starts its evidence writers before it accepts connections. It does not start if these writes fail or if an existing evidence record conflicts and cannot be validated. Shutdown and a failed start after registration use the same time-bounded finalization, which first resolves any evidence write still awaiting confirmation and never begins a new summary while one is unresolved; an instance-closed record is written only after all aggregate evidence has been confirmed within that bound, and a forced shutdown is recorded as such and is not treated as complete evidence.
+
+- Missing sequence ranges are recorded as explicit gaps, including a missing initial range. Missing rate-limit activity is derived only from recorded totals and never estimated; rejection-audit activity is never attributed to a missing range, and the summary that follows a gap is marked as not verified for audit alignment. A sequence range that overlaps or runs backwards is never recorded or converted into a gap; evidence recording stops for that instance, it is never recorded as cleanly closed, and its remaining activity is reported as unknown.
+
+- Reports distinguish confirmed activity, confirmed zero activity (zero in both rate-limit and rejection-audit counters), known gaps and unknown activity, including activity that may have occurred after a forced shutdown; counts that were not durably recorded before an abnormal termination are reported as unknown (D-023).
+
 # 18. Security Model
 
 ## Webhook security
@@ -895,6 +916,8 @@ Per D-017, webhook secrets are initially supplied through environment-backed con
 - Rejected webhook deliveries must be recorded durably as security-audit evidence, consistent with the EVENT_REJECTED audit event (Section 17) and the Rejected and recorded failure-test expectation (Section 19). Structured application logging is not a substitute for a durable audit record. This requirement is planned as Task 011A and is not implemented by Task 010A.
 
 - Rate limiting on the webhook endpoint is specified in Section 10 ("Webhook rate limiting (Task 011B)") and by D-018 to D-020. Rejections converted to HTTP 429 because a peer's rejection allowance is exhausted, and all other rate-limited requests, are evidenced through aggregate summaries rather than individual rejection records. Task 011A must record those summaries durably and must record evidence gaps without inventing counts.
+
+- Task 011A implements durable rejection recording and rate-limit evidence persistence as specified in Section 17 ("Webhook rejection and rate-limit evidence (Task 011A)") and D-021 to D-023.
 
 ## Operations console
 
@@ -962,6 +985,8 @@ Sensitive values must be redacted. Raw authorization headers, tokens, webhook se
 | Malformed payload                | Rejected safely                                                               |
 | Invalid signature                | Rejected and recorded                                                         |
 | Webhook request flood            | Generic 429 with Retry-After before body processing; aggregate rate-limit evidence recorded |
+| Audit store unavailable          | Webhook responses and rate-limit decisions unchanged; unrecorded rejections counted in aggregate evidence once a summary is persisted; API does not start if startup evidence cannot be recorded |
+| Unclean process termination      | Evidence gap recorded on the next start; activity after the last durable summary reported as unknown |
 | Timeout after remote side effect | UNKNOWN then verify/reconcile, not blind duplicate create                     |
 | Retry exhaustion                 | FAILED state + operator path                                                  |
 | Manual replay                    | History preserved; new processing attempt recorded                            |
@@ -1245,6 +1270,9 @@ Task 010A delivers only the transport boundary and a fail-closed ingestion hando
 | D-018  | Webhook rate limiting (Task 011B) uses a custom in-process token-bucket limiter in apps/api with three layers: L1 per-peer requests; L2 per-peer individual-rejection allowance, consumed synchronously before a rejection is sent, otherwise converted to 429, and denying all requests from a peer whose allowance is exhausted before verification; L3 per-Integration.id deliveries accepted by the Task 010 verifier, before the ingestion handoff. Every table has a fixed key capacity with a shared overflow bucket. No new dependency, no Redis, no trusted forwarding headers. | ACCEPTED | Limits provisional; L3 limits, capacity and overflow re-evaluated after Task 011 measurements; all limits and the shared-address Layer 2 risk re-evaluated before public exposure (O-011) |
 | D-019  | The fixed API error-code set adds TOO_MANY_REQUESTS (HTTP 429): generic flat body with server request ID, Retry-After, Connection: close, no rate-limit quota headers | ACCEPTED | Task 011B |
 | D-020  | Client network addresses are not logged by default; rate-limit log events carry a process-scoped keyed fingerprint of the normalized peer key | ACCEPTED | Edge source-address logging requires a separate decision |
+| D-021  | Rate-limit and rejection-audit aggregate evidence, evidence gaps and limiter-instance lifecycle records are stored in a dedicated RateLimitEvidence entity with enforced natural keys, complete-record idempotency comparison and overlap rejection | ACCEPTED | Task 011A; implemented after Task 011 establishes the database runtime |
+| D-022  | Rejected webhook deliveries are recorded as AuditEntry rows (action EVENT_REJECTED, id = server-generated request ID) with an allowlisted field set and an observed response-completion state, behind a global write ceiling and bounded queue, submitted after the response finish or a preceding close is observed | ACCEPTED | Task 011A; limits provisional |
+| D-023  | Evidence completeness is reported explicitly: confirmed activity, confirmed zero activity, known gaps and unknown activity (including after an unclean termination or a forced shutdown) are distinguished, and uncaptured counts are never estimated | ACCEPTED | Task 011A |
 
 Unresolved reference: prisma/schema.prisma refers to decision D-014 (Operation event/endpoint integration consistency check). No D-014 entry exists in this register, and its content cannot presently be reconstructed from this specification or the available repository history; the ID is reserved and must not be reused or assigned by inference. Related discrepancy: Section 13 lists integrationId on Operation, but the current schema has no such column. No design is changed by this note; reconciliation is assigned to a future schema/domain task, to be identified when that task is scoped.
 
@@ -1263,6 +1291,7 @@ Unresolved reference: prisma/schema.prisma refers to decision D-014 (Operation e
 | O-009  | Retention/archival policy                                                  | Operational hardening        |
 | O-010  | Exact portfolio benchmark workload                                         | Testing/metrics phase        |
 | O-011  | Connection-level protection, trusted-proxy client-address derivation (including reassessment of the shared Layer 2 rejection allowance), and handling of Node.js-level malformed-HTTP, framing and timeout events, which are outside all application-level rate-limit guarantees and counters and use non-flat response bodies | Deployment (with O-008); must be resolved before public exposure |
+| O-012  | Multi-instance evidence scoping: deployment-slot scoping versus a liveness lease for detecting abandoned limiter instances (V1 assumes one live API process per scope) | Deployment (with O-008); before running more than one API process |
 
 # 27. Portfolio Demonstration Plan
 

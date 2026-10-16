@@ -248,6 +248,18 @@ describe("generic errors", () => {
     assert.equal(codeForFrameworkError(new Error("x")), "INTERNAL_ERROR");
     assert.equal(codeForFrameworkError(undefined), "INTERNAL_ERROR");
   });
+
+  it("T16: maps status 429 to TOO_MANY_REQUESTS, not the generic 4xx fallback", () => {
+    assert.equal(
+      codeForFrameworkError({ statusCode: 429, message: "SECRET-MESSAGE" }),
+      "TOO_MANY_REQUESTS",
+    );
+    assert.equal(statusFor("TOO_MANY_REQUESTS"), 429);
+    assert.deepEqual(errorBody("TOO_MANY_REQUESTS", "req-1"), {
+      error: "TOO_MANY_REQUESTS",
+      requestId: "req-1",
+    });
+  });
 });
 
 describe("safePath", () => {

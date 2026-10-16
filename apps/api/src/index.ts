@@ -17,3 +17,22 @@ export type {
 } from "./handoff.js";
 export { createSecretResolver } from "./secrets.js";
 export type { SecretResolver } from "./secrets.js";
+export { createRateLimiter, mergeSummaries } from "./rate-limit.js";
+export type {
+  BucketPolicy,
+  Counters,
+  Decision,
+  Denial,
+  DistinctKeys,
+  Layer,
+  LayerCounters,
+  MergeResult,
+  PeekResult,
+  PeerKey,
+  RateLimitEvidence,
+  RateLimitPolicies,
+  RateLimitSummary,
+  RateLimiter,
+  TableGauge,
+  TablePolicy,
+} from "./rate-limit.js";

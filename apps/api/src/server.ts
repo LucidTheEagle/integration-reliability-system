@@ -17,6 +17,14 @@ import {
 import type { IngestionHandoff } from "./handoff.js";
 import { buildLoggerOptions, safePath } from "./logging.js";
 import type { LoggerSettings } from "./logging.js";
+import { createRateLimiter } from "./rate-limit.js";
+import type {
+  Decision,
+  Denial,
+  PeekResult,
+  PeerKey,
+  RateLimiter,
+} from "./rate-limit.js";
 import type { SecretResolver } from "./secrets.js";
 
 /** The server binds to loopback only. */
@@ -36,6 +44,12 @@ export interface ServerDependencies {
   readonly verifyWebhook?: typeof verifyIrsV1Webhook;
   /** Clock used for the receipt timestamp and signature tolerance. */
   readonly now?: () => Date;
+  /**
+   * Request-path half of a `createRateLimiter()` pair. When absent, a
+   * default limiter is created and its evidence half is discarded: limits
+   * are still enforced, but summaries cannot be drained.
+   */
+  readonly rateLimiter?: RateLimiter;
 }
 
 export interface ServerOptions {
@@ -62,12 +76,158 @@ interface RequestContext {
   readonly receivedAt: Date;
 }
 
-function sendError(
-  reply: FastifyReply,
-  code: ApiErrorCode,
-  requestId: string,
-): FastifyReply {
-  return reply.code(statusFor(code)).send(errorBody(code, requestId));
+/**
+ * Rejections that consume the peer's rejection allowance (L2) before they
+ * are sent; with no allowance left they are sent as 429 instead.
+ */
+const ALLOWANCE_ELIGIBLE: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
+  "BAD_REQUEST",
+  "UNAUTHORIZED",
+  "NOT_FOUND",
+  "PAYLOAD_TOO_LARGE",
+  "UNSUPPORTED_MEDIA_TYPE",
+]);
+
+/** @internal — test seam, not public API */
+export interface ResponseGate {
+  setPeer(request: FastifyRequest, peer: PeerKey): void;
+  /** The peer stored at P1/P2, or computed from the socket if absent. */
+  peerOf(request: FastifyRequest): PeerKey;
+  /** The rejection code if this request consumed L2 allowance (B1). */
+  individualRejectionOf(request: FastifyRequest): ApiErrorCode | undefined;
+  deliver(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    status: 202 | ApiErrorCode,
+    extraHeaders?: Readonly<Record<string, string>>,
+  ): FastifyReply;
+  send429(request: FastifyRequest, reply: FastifyReply, denial: Denial): FastifyReply;
+  rejectWith(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    code: ApiErrorCode,
+    extraHeaders?: Readonly<Record<string, string>>,
+  ): FastifyReply;
+  fault(request: FastifyRequest, reply: FastifyReply): FastifyReply;
+}
+
+// The single path for every application response (202, errors, 429), and
+// the server-local request state it needs. Created once per buildServer.
+/** @internal — test seam, not public API */
+export function createResponseGate(limiter: RateLimiter): ResponseGate {
+  const peers = new WeakMap<FastifyRequest, PeerKey>();
+  const aborted = new WeakSet<FastifyRequest>();
+  const individualRejections = new WeakMap<FastifyRequest, ApiErrorCode>();
+
+  function peerOf(request: FastifyRequest): PeerKey {
+    return peers.get(request) ?? limiter.peerKey(request.raw.socket?.remoteAddress);
+  }
+
+  /**
+   * No caller sets a status or header before this. A destroyed reply is
+   * never written to: the abort is recorded once per request.
+   */
+  function deliver(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    status: 202 | ApiErrorCode,
+    extraHeaders?: Readonly<Record<string, string>>,
+  ): FastifyReply {
+    if (reply.raw.destroyed) {
+      if (!aborted.has(request)) {
+        aborted.add(request);
+        try {
+          limiter.recordAbortedBeforeResponse();
+        } catch {
+          // Secondary failure: nothing can be reported on this request.
+        }
+      }
+      // DEV-1: Fastify 5.12.5 continues the lifecycle (body parsing,
+      // handler) after an onRequest hook returns an unsent reply. Hijacking
+      // ends it without writing anything.
+      try {
+        reply.hijack();
+      } catch {
+        // Nothing further can be done for a destroyed reply.
+      }
+      return reply;
+    }
+    if (extraHeaders !== undefined) {
+      for (const [name, value] of Object.entries(extraHeaders)) {
+        reply.header(name, value);
+      }
+    }
+    if (status === 202) {
+      return reply.code(202).send({ status: "ACCEPTED", requestId: request.id });
+    }
+    return reply.code(statusFor(status)).send(errorBody(status, request.id));
+  }
+
+  function fault(request: FastifyRequest, reply: FastifyReply): FastifyReply {
+    try {
+      limiter.recordFault();
+    } catch {
+      // Secondary failure; the response is still the generic 500.
+    }
+    return deliver(request, reply, "INTERNAL_ERROR");
+  }
+
+  function send429(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    denial: Denial,
+  ): FastifyReply {
+    // Only the log attempt is guarded; delivery below is outside the catch,
+    // so a delivery failure can never produce a second response.
+    if (denial.log !== null) {
+      try {
+        request.log.warn(
+          { layer: denial.layer, peer: denial.log.peer },
+          "rate limit exceeded",
+        );
+      } catch {
+        return fault(request, reply);
+      }
+    }
+    return deliver(request, reply, "TOO_MANY_REQUESTS", {
+      "retry-after": String(denial.retryAfterSeconds),
+      connection: "close",
+    });
+  }
+
+  function rejectWith(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    code: ApiErrorCode,
+    extraHeaders?: Readonly<Record<string, string>>,
+  ): FastifyReply {
+    if (reply.raw.destroyed || !ALLOWANCE_ELIGIBLE.has(code)) {
+      return deliver(request, reply, code, extraHeaders);
+    }
+    let decision: Decision;
+    try {
+      decision = limiter.consumeRejectionAllowance(peerOf(request));
+    } catch {
+      return fault(request, reply);
+    }
+    if (decision.allowed) {
+      individualRejections.set(request, code);
+      return deliver(request, reply, code, extraHeaders);
+    }
+    return send429(request, reply, decision);
+  }
+
+  return {
+    setPeer: (request, peer) => {
+      peers.set(request, peer);
+    },
+    peerOf,
+    individualRejectionOf: (request) => individualRejections.get(request),
+    deliver,
+    send429,
+    rejectWith,
+    fault,
+  };
 }
 
 /**
@@ -97,6 +257,9 @@ export function buildServer(
 ): FastifyInstance {
   const verifyWebhook = dependencies.verifyWebhook ?? verifyIrsV1Webhook;
   const now = dependencies.now ?? (() => new Date());
+  // Without an injected limiter the evidence half is discarded (HD-18).
+  const limiter = dependencies.rateLimiter ?? createRateLimiter().limiter;
+  const gate = createResponseGate(limiter);
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const headersTimeoutMs = Math.min(
     options.headersTimeoutMs ?? DEFAULT_HEADERS_TIMEOUT_MS,
@@ -146,7 +309,22 @@ export function buildServer(
         { statusCode: statusFor(code), route: "unmatched" },
         "request rejected before routing",
       );
-      sendError(reply, code, request.id);
+      // P1: no onRequest hook runs for these requests, so L1 is charged
+      // here before the rejection gate.
+      let decision: Decision;
+      try {
+        const peer = limiter.peerKey(request.raw.socket?.remoteAddress);
+        gate.setPeer(request, peer);
+        decision = limiter.consumeRequest(peer);
+      } catch {
+        gate.fault(request, reply);
+        return;
+      }
+      if (!decision.allowed) {
+        gate.send429(request, reply, decision);
+        return;
+      }
+      gate.rejectWith(request, reply, code);
     },
   });
   app.server.headersTimeout = headersTimeoutMs;
@@ -166,6 +344,40 @@ export function buildServer(
 
   const contexts = new WeakMap<FastifyRequest, RequestContext>();
 
+  // P2: peer limits for every routed request (including not-found), before
+  // any route work. Registered before the not-found handler and the route.
+  app.addHook("onRequest", async (request, reply) => {
+    let peer: PeerKey;
+    let decision: Decision;
+    try {
+      peer = limiter.peerKey(request.raw.socket?.remoteAddress);
+      gate.setPeer(request, peer);
+      decision = limiter.consumeRequest(peer);
+    } catch {
+      return gate.fault(request, reply);
+    }
+    if (!decision.allowed) return gate.send429(request, reply, decision);
+
+    // L2 precheck (HD-20): while the peer's rejection allowance holds less
+    // than one token, every request from it is refused before verification.
+    let peek: PeekResult;
+    try {
+      peek = limiter.peekRejectionAllowance(peer);
+    } catch {
+      return gate.fault(request, reply);
+    }
+    if (!peek.allowed) {
+      let denial: Denial;
+      try {
+        denial = limiter.recordPrecheckDenied(peer, peek);
+      } catch {
+        return gate.fault(request, reply);
+      }
+      return gate.send429(request, reply, denial);
+    }
+    return undefined;
+  });
+
   app.setErrorHandler((error, request, reply) => {
     const code = codeForFrameworkError(error);
     if (code === "INTERNAL_ERROR") {
@@ -179,15 +391,18 @@ export function buildServer(
         "unhandled request error",
       );
     }
-    if (code === "PAYLOAD_TOO_LARGE") {
-      // The remainder of an oversized body must not be read on this socket.
-      reply.header("connection", "close");
-    }
-    return sendError(reply, code, request.id);
+    // The remainder of an oversized body must not be read on this socket;
+    // the header is applied by deliver(), never to a destroyed reply.
+    return gate.rejectWith(
+      request,
+      reply,
+      code,
+      code === "PAYLOAD_TOO_LARGE" ? { connection: "close" } : undefined,
+    );
   });
 
   app.setNotFoundHandler((request, reply) =>
-    sendError(reply, "NOT_FOUND", request.id),
+    gate.rejectWith(request, reply, "NOT_FOUND"),
   );
 
   app.addHook("onResponse", (request, reply, done) => {
@@ -217,7 +432,7 @@ export function buildServer(
       // 1. Identifier format. Malformed identifiers never reach a lookup.
       const integrationId = parseIntegrationId(request.params.integrationKey);
       if (integrationId === null) {
-        return sendError(reply, "NOT_FOUND", request.id);
+        return gate.rejectWith(request, reply, "NOT_FOUND");
       }
 
       // 2. Header guards (duplicates, missing IRS-Signature, content type
@@ -225,14 +440,14 @@ export function buildServer(
       //    before the body is consumed.
       const headers = evaluateRequestHeaders(request.raw.rawHeaders);
       if (!headers.ok) {
-        return sendError(reply, headers.code, request.id);
+        return gate.rejectWith(request, reply, headers.code);
       }
 
       // 3. Secret resolution, only after the header checks. An identifier
       //    without a configured secret fails closed.
       const secret = dependencies.secrets(integrationId);
       if (secret === undefined) {
-        return sendError(reply, "NOT_FOUND", request.id);
+        return gate.rejectWith(request, reply, "NOT_FOUND");
       }
 
       contexts.set(request, {
@@ -247,7 +462,7 @@ export function buildServer(
     handler: async (request, reply) => {
       const context = contexts.get(request);
       if (context === undefined || !(request.body instanceof Uint8Array)) {
-        return sendError(reply, "BAD_REQUEST", request.id);
+        return gate.rejectWith(request, reply, "BAD_REQUEST");
       }
 
       // A standalone, exactly-sized copy: the same array is given to the
@@ -264,8 +479,18 @@ export function buildServer(
       });
 
       if (!result.ok) {
-        return sendError(reply, codeForRejection(result.rejection), request.id);
+        return gate.rejectWith(request, reply, codeForRejection(result.rejection));
       }
+
+      // P6: L3 only after the verifier has accepted signature, timestamp,
+      // payload and envelope; before the ingestion handoff.
+      let decision: Decision;
+      try {
+        decision = limiter.consumeVerified(context.integrationId, gate.peerOf(request));
+      } catch {
+        return gate.fault(request, reply);
+      }
+      if (!decision.allowed) return gate.send429(request, reply, decision);
 
       // Outcome contract: ACCEPTED -> 202, UNAVAILABLE -> 503. Anything
       // else (a thrown error, or an outcome outside the contract) is an
@@ -287,7 +512,7 @@ export function buildServer(
         // Name only: messages and stacks may carry sensitive data.
         const name = error instanceof Error ? error.name : undefined;
         request.log.error({ errorName: name }, "ingestion handoff failed");
-        return sendError(reply, "INTERNAL_ERROR", request.id);
+        return gate.rejectWith(request, reply, "INTERNAL_ERROR");
       }
 
       const status =
@@ -295,15 +520,13 @@ export function buildServer(
           ? (outcome as { status?: unknown }).status
           : undefined;
       if (status === "ACCEPTED") {
-        return reply
-          .code(202)
-          .send({ status: "ACCEPTED", requestId: request.id });
+        return gate.deliver(request, reply, 202);
       }
       if (status === "UNAVAILABLE") {
-        return sendError(reply, "SERVICE_UNAVAILABLE", request.id);
+        return gate.rejectWith(request, reply, "SERVICE_UNAVAILABLE");
       }
       request.log.error("ingestion handoff returned an invalid outcome");
-      return sendError(reply, "INTERNAL_ERROR", request.id);
+      return gate.rejectWith(request, reply, "INTERNAL_ERROR");
     },
   });
 

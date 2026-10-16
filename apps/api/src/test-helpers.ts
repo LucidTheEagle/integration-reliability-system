@@ -12,6 +12,12 @@ import type {
   IngestionOutcome,
   IngestionRequest,
 } from "./handoff.js";
+import { createRateLimiter } from "./rate-limit.js";
+import type {
+  RateLimitEvidence,
+  RateLimitPolicies,
+  RateLimiter,
+} from "./rate-limit.js";
 import { createSecretResolver } from "./secrets.js";
 import { buildServer } from "./server.js";
 import type { ServerOptions } from "./server.js";
@@ -67,9 +73,27 @@ export function validRequest(body: string | Buffer = envelopeJson()): {
   };
 }
 
+/**
+ * Manual monotonic clock for the rate limiter. `wall()` moves in step
+ * with it, starting at NOW. Nothing advances unless a test calls advance().
+ */
+export class ManualClock {
+  private elapsedMs = 0;
+  readonly now = (): number => this.elapsedMs;
+  readonly wall = (): Date => new Date(NOW.getTime() + this.elapsedMs);
+  advance(ms: number): void {
+    this.elapsedMs += ms;
+  }
+}
+
 export class LogCapture {
   readonly lines: string[] = [];
+  /** A write containing `throwOn` throws instead of being recorded. */
+  constructor(private readonly throwOn?: string) {}
   write(message: string): void {
+    if (this.throwOn !== undefined && message.includes(this.throwOn)) {
+      throw new Error("log write failed");
+    }
     this.lines.push(message);
   }
   text(): string {
@@ -98,6 +122,45 @@ export class RecordingHandoff implements IngestionHandoff {
   }
 }
 
+export type LimiterMethod = keyof RateLimiter;
+
+export interface LimiterSpy {
+  /** Pass this to the server; calls go to `overrides` first, then the inner limiter. */
+  readonly limiter: RateLimiter;
+  /** Calls per method, including calls that threw. */
+  readonly calls: Record<LimiterMethod, number>;
+}
+
+const LIMITER_METHODS: readonly LimiterMethod[] = [
+  "peerKey",
+  "consumeRequest",
+  "peekRejectionAllowance",
+  "recordPrecheckDenied",
+  "consumeRejectionAllowance",
+  "consumeVerified",
+  "recordAbortedBeforeResponse",
+  "recordFault",
+];
+
+/** Counts limiter calls; `overrides` replace methods (for example to throw). */
+export function spyLimiter(
+  inner: RateLimiter,
+  overrides: Partial<RateLimiter> = {},
+): LimiterSpy {
+  const calls = Object.fromEntries(
+    LIMITER_METHODS.map((name) => [name, 0]),
+  ) as Record<LimiterMethod, number>;
+  const wrapped: Record<string, unknown> = {};
+  for (const name of LIMITER_METHODS) {
+    const target = (overrides[name] ?? inner[name]) as (...args: unknown[]) => unknown;
+    wrapped[name] = (...args: unknown[]) => {
+      calls[name] += 1;
+      return target(...args);
+    };
+  }
+  return { limiter: wrapped as unknown as RateLimiter, calls };
+}
+
 export interface TestApp {
   readonly app: FastifyInstance;
   readonly handoff: RecordingHandoff;
@@ -105,6 +168,12 @@ export interface TestApp {
   readonly verifyInputs: VerifyIrsV1WebhookInput[];
   /** Integration IDs passed to the secret resolver, in call order. */
   readonly resolved: string[];
+  /** Present when `rateLimit` was given: the unwrapped request-path half. */
+  readonly limiter?: RateLimiter;
+  /** Present when `rateLimit` was given. */
+  readonly evidence?: RateLimitEvidence;
+  /** Present when `rateLimit` was given. */
+  readonly clock?: ManualClock;
 }
 
 export function makeApp(
@@ -112,10 +181,35 @@ export function makeApp(
     handoff?: RecordingHandoff;
     server?: ServerOptions;
     secrets?: Record<string, string>;
+    /** Composes a limiter pair on a manual clock; omitted -> server default. */
+    rateLimit?: {
+      policies?: Partial<RateLimitPolicies>;
+      clock?: ManualClock;
+      /** Wraps the limiter given to the server (spies, stubs). */
+      wrap?: (limiter: RateLimiter) => RateLimiter;
+    };
+    logs?: LogCapture;
+    /** Replaces the real verifier; inputs are still recorded. */
+    verifyWebhook?: typeof verifyIrsV1Webhook;
   } = {},
 ): TestApp {
   const handoff = options.handoff ?? new RecordingHandoff();
-  const logs = new LogCapture();
+  const logs = options.logs ?? new LogCapture();
+  const verify = options.verifyWebhook ?? verifyIrsV1Webhook;
+  let rateLimit:
+    | { limiter: RateLimiter; evidence: RateLimitEvidence; clock: ManualClock }
+    | undefined;
+  if (options.rateLimit !== undefined) {
+    const clock = options.rateLimit.clock ?? new ManualClock();
+    const pair = createRateLimiter({
+      ...(options.rateLimit.policies === undefined
+        ? {}
+        : { policies: options.rateLimit.policies }),
+      monotonicNow: clock.now,
+      wallNow: clock.wall,
+    });
+    rateLimit = { limiter: pair.limiter, evidence: pair.evidence, clock };
+  }
   const verifyInputs: VerifyIrsV1WebhookInput[] = [];
   const resolved: string[] = [];
   const secrets = new Map<string, Uint8Array>(
@@ -137,12 +231,18 @@ export function makeApp(
       now: () => NOW,
       verifyWebhook: (input) => {
         verifyInputs.push(input);
-        return verifyIrsV1Webhook(input);
+        return verify(input);
       },
+      ...(rateLimit === undefined
+        ? {}
+        : {
+            rateLimiter:
+              options.rateLimit?.wrap?.(rateLimit.limiter) ?? rateLimit.limiter,
+          }),
     },
     { logger: { level: "info", stream: logs }, ...options.server },
   );
-  return { app, handoff, logs, verifyInputs, resolved };
+  return { app, handoff, logs, verifyInputs, resolved, ...rateLimit };
 }
 
 export async function listen(app: FastifyInstance): Promise<number> {

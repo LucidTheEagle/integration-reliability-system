@@ -30,7 +30,7 @@ Purpose: the authoritative specification used to guide research, architecture, i
 | Status                             | Architecture baseline; implementation in progress. Tasks 010 and 010A are implemented, committed and integrated into local main. Phase 3 (Webhook ingestion) remains in progress until the acceptance criteria for Task 011, Task 011A and Task 011B are satisfied.                                                                                                                                                                                                                          |
 | Version                            | 1.0                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Last updated                       | October 2026                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). 2026-10-13: Task 011B webhook rate-limiting design approved (Section 10 "Webhook rate limiting (Task 011B)"; D-018, D-019, D-020; O-011 added); fixed API error-code set recorded (Section 16); Sections 17, 18 and 19 updated accordingly. Version designation unchanged (V1.0). 2026-10-14: Task 011A webhook security-audit and rate-limit evidence design approved (Section 13 RateLimitEvidence; Section 17 "Webhook rejection and rate-limit evidence (Task 011A)"; D-021, D-022, D-023; O-012 added); Sections 18 and 19 updated accordingly. Version designation unchanged (V1.0). |
+| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). 2026-10-13: Task 011B webhook rate-limiting design approved (Section 10 "Webhook rate limiting (Task 011B)"; D-018, D-019, D-020; O-011 added); fixed API error-code set recorded (Section 16); Sections 17, 18 and 19 updated accordingly. Version designation unchanged (V1.0). 2026-10-14: Task 011A webhook security-audit and rate-limit evidence design approved (Section 13 RateLimitEvidence; Section 17 "Webhook rejection and rate-limit evidence (Task 011A)"; D-021, D-022, D-023; O-012 added); Sections 18 and 19 updated accordingly. Version designation unchanged (V1.0). 2026-10-16: Task 011 durable event ingestion design approved (Section 10 "Durable event ingestion (Task 011)" and the Layer 2 rejection-status list; Section 13 Event fields and payload strategy; Section 16 error-code set; Sections 17 and 19; D-024, D-025, D-026, D-027, D-028). Version designation unchanged (V1.0). |
 
 # How This Document Is Used
 
@@ -569,7 +569,7 @@ Task 011B bounds the volume of requests reaching POST /api/webhooks/:integration
 
 - Layer 1 limits all requests per network peer before any route processing.
 
-- Layer 2 limits the number of individually delivered rejections (HTTP 400, 401, 404, 413 and 415) per network peer. Valid requests do not consume this allowance. While a peer's allowance holds less than one unit, every request from that peer, including an otherwise valid signed request, receives the rate-limit response before signature verification until the allowance refills. Peers that share a network address therefore share this allowance, and a sender that repeatedly causes rejections can keep a shared address blocked. This behaviour is a development policy and must be reassessed before public exposure (O-011).
+- Layer 2 limits the number of individually delivered rejections (HTTP 400, 401, 404, 413, 415 and 422) per network peer. Valid requests do not consume this allowance. While a peer's allowance holds less than one unit, every request from that peer, including an otherwise valid signed request, receives the rate-limit response before signature verification until the allowance refills. Peers that share a network address therefore share this allowance, and a sender that repeatedly causes rejections can keep a shared address blocked. This behaviour is a development policy and must be reassessed before public exposure (O-011).
 
 - Layer 3 limits deliveries per Integration.id after the Task 010 verifier has accepted the signature, timestamp, payload and envelope, and before the ingestion handoff. No per-integration limit is applied, and no per-integration entry is created, before signature verification.
 
@@ -588,6 +588,24 @@ Task 011B bounds the volume of requests reaching POST /api/webhooks/:integration
 - Initial limits are provisional development defaults. Layer 3 limits, key capacity and overflow behaviour must be re-evaluated after Task 011 throughput measurements; all limits must be re-evaluated before public deployment.
 
 - Rate-limit evidence is produced as bounded aggregate summaries with sequence coverage for Task 011A (Section 17). Counters that have not yet been durably recorded are lost if the process terminates abnormally; such gaps must be recorded explicitly and never estimated.
+
+## Durable event ingestion (Task 011)
+
+- A verified delivery admitted by Layer 3 is persisted in one database transaction before any successful response. HTTP 202 is sent only after the transaction commit has been acknowledged.
+
+- The inbound idempotency key is (Integration.id, externalEventId), enforced by a unique constraint. A delivery whose key already exists is a duplicate: it receives the same HTTP 202 response as a new event, never modifies the stored event, and is recorded durably.
+
+- Every accepted delivery, new or duplicate, is recorded as an AuditEntry with action EVENT_RECEIVED whose identifier equals the server-generated request ID, in the same transaction as the event.
+
+- A duplicate whose received bytes differ from the stored event is acknowledged and recorded as a content mismatch; the stored event is never overwritten.
+
+- Database unavailability, contention, timeouts and commit outcomes that cannot be confirmed produce HTTP 503; data, configuration and internal faults produce HTTP 500. Neither implies that the event was or was not stored, and a retried delivery is resolved through the idempotency key.
+
+- Accepted events are stored in state VALIDATED; queue dispatch is Task 012.
+
+- Only integrations whose configuration status is ACTIVE are eligible for webhook ingestion. A verified, admitted delivery for an integration that is DRAFT, DISABLED or DECOMMISSIONED, or that is not registered, receives HTTP 404 and creates no event and no EVENT_RECEIVED record; any rejection evidence follows the rejection-audit rules.
+
+- A verified, admitted delivery whose payload contains a condition that a deterministic pre-validation proves cannot be stored (a U+0000 character or an unpaired surrogate) receives HTTP 422 UNPROCESSABLE_PAYLOAD before any ingestion-path database access and creates no event. Database errors, timeouts, connectivity failures and unconfirmed commits never produce HTTP 422.
 
 ## Security constraint
 
@@ -670,7 +688,7 @@ The following schema is the current design proposal and will be validated before
 | IntegrationEndpoint | id, integrationId, name, method, path, operationType, enabled, retryPolicyId                                                                                |
 | Credential          | id, integrationId, type, status, expiresAt, lastRefreshedAt                                                                                                 |
 | RetryPolicy         | id, name, maxAttempts, backoffStrategy, baseDelayMs, maxDelayMs, jitter, respectRetryAfter                                                                  |
-| Event               | id, integrationId, externalEventId, eventType, resourceType, resourceId, payload, metadata, occurredAt, receivedAt, status, schemaVersion, correlationId    |
+| Event               | id, integrationId, externalEventId, eventType, resourceType, resourceId, payload, rawBody, rawBodySha256, metadata, occurredAt, receivedAt, status, schemaVersion, correlationId |
 | Operation           | id, eventId, integrationId, endpointId, operationType, resourceType, resourceId, idempotencyKey, status, createdAt, updatedAt                               |
 | ProcessingAttempt   | id, eventId, operationId, attemptNumber, status, startedAt, completedAt, durationMs, failureCategory, errorCode, errorMessage, httpStatus, responseMetadata |
 | SystemResource      | id, integrationId, resourceType, externalId, displayLabel, metadata                                                                                         |
@@ -694,7 +712,7 @@ Rejected webhook deliveries are recorded as AuditEntry rows with action EVENT_RE
 
 ## Payload strategy
 
-Event payloads will initially use PostgreSQL JSONB because the portfolio workload assumes modest payload sizes and operational inspection is valuable. Larger payload/object-storage strategies are deferred.
+Event payloads will initially use PostgreSQL JSONB because the portfolio workload assumes modest payload sizes and operational inspection is valuable. Larger payload/object-storage strategies are deferred. Accepted webhook events also store the exact received request bytes (rawBody) and their SHA-256 digest; the parsed payload is stored as JSONB for inspection and is never used to reconstruct the original bytes (Task 011).
 
 # 14. Reconciliation Architecture
 
@@ -822,7 +840,7 @@ Destructive or side-effecting controls should be explicit. The UI must distingui
 
 This is a contract map, not a final OpenAPI specification. Request/response shapes will be defined as implementation tasks reach the relevant boundary.
 
-Error responses from apps/api use a generic flat body {"error": <code>, "requestId": <server-generated request ID>} with a closed set of fixed codes: BAD_REQUEST (400), UNAUTHORIZED (401), NOT_FOUND (404), REQUEST_TIMEOUT (408), PAYLOAD_TOO_LARGE (413), UNSUPPORTED_MEDIA_TYPE (415), TOO_MANY_REQUESTS (429), INTERNAL_ERROR (500) and SERVICE_UNAVAILABLE (503) (D-019). Responses generated by the Node.js HTTP layer before the application observes a request are outside this contract and outside all application-level rate-limit guarantees and counters (O-011).
+Error responses from apps/api use a generic flat body {"error": <code>, "requestId": <server-generated request ID>} with a closed set of fixed codes: BAD_REQUEST (400), UNAUTHORIZED (401), NOT_FOUND (404), REQUEST_TIMEOUT (408), PAYLOAD_TOO_LARGE (413), UNSUPPORTED_MEDIA_TYPE (415), UNPROCESSABLE_PAYLOAD (422), TOO_MANY_REQUESTS (429), INTERNAL_ERROR (500) and SERVICE_UNAVAILABLE (503) (D-019, D-027). Responses generated by the Node.js HTTP layer before the application observes a request are outside this contract and outside all application-level rate-limit guarantees and counters (O-011).
 
 # 17. Observability & Audit
 
@@ -870,6 +888,8 @@ The persistent operational timeline should tell the story of what happened witho
 - CREDENTIAL_REFRESHED
 
 - OPERATOR_ACTION
+
+EVENT_RECEIVED records each accepted webhook delivery and whether it created a new event or was a duplicate (Task 011).
 
 Webhook requests rejected with HTTP 429 are not recorded as individual EVENT_REJECTED entries. They are recorded as bounded aggregate summaries that identify the limiter instance and the sequence range they cover. Missing coverage, including coverage lost through abnormal process termination, is recorded explicitly as an evidence gap without estimated counts. Evidence records are immutable once a write is attempted and are persisted transactionally or idempotently. Event names and persistence are defined by Task 011A.
 
@@ -987,6 +1007,8 @@ Sensitive values must be redacted. Raw authorization headers, tokens, webhook se
 | Webhook request flood            | Generic 429 with Retry-After before body processing; aggregate rate-limit evidence recorded |
 | Audit store unavailable          | Webhook responses and rate-limit decisions unchanged; unrecorded rejections counted in aggregate evidence once a summary is persisted; API does not start if startup evidence cannot be recorded |
 | Unclean process termination      | Evidence gap recorded on the next start; activity after the last durable summary reported as unknown |
+| Concurrent duplicate webhooks | Exactly one event; every delivery acknowledged and recorded |
+| Database unavailable during ingestion | HTTP 503, no acknowledgement; retried delivery accepted once the database recovers |
 | Timeout after remote side effect | UNKNOWN then verify/reconcile, not blind duplicate create                     |
 | Retry exhaustion                 | FAILED state + operator path                                                  |
 | Manual replay                    | History preserved; new processing attempt recorded                            |
@@ -1273,6 +1295,11 @@ Task 010A delivers only the transport boundary and a fail-closed ingestion hando
 | D-021  | Rate-limit and rejection-audit aggregate evidence, evidence gaps and limiter-instance lifecycle records are stored in a dedicated RateLimitEvidence entity with enforced natural keys, complete-record idempotency comparison and overlap rejection | ACCEPTED | Task 011A; implemented after Task 011 establishes the database runtime |
 | D-022  | Rejected webhook deliveries are recorded as AuditEntry rows (action EVENT_REJECTED, id = server-generated request ID) with an allowlisted field set and an observed response-completion state, behind a global write ceiling and bounded queue, submitted after the response finish or a preceding close is observed | ACCEPTED | Task 011A; limits provisional |
 | D-023  | Evidence completeness is reported explicitly: confirmed activity, confirmed zero activity, known gaps and unknown activity (including after an unclean termination or a forced shutdown) are distinguished, and uncaptured counts are never estimated | ACCEPTED | Task 011A |
+| D-024  | Durable ingestion (Task 011): one READ COMMITTED transaction per delivery; duplicates acknowledged with HTTP 202 and recorded as EVENT_RECEIVED; 202 only after commit acknowledgement | ACCEPTED | Task 011 |
+| D-025  | Accepted events store the exact received bytes (bytea) and SHA-256 alongside the JSONB payload | ACCEPTED | Task 011; retention O-009 |
+| D-026  | @irs/db owns the Prisma 7.10 runtime client (adapter-pg), transactions, transaction-scoped advisory locks and bounded disconnect; apps/api owns composition and lifecycle | ACCEPTED | Task 011; used by Task 011A |
+| D-027  | The fixed API error-code set adds UNPROCESSABLE_PAYLOAD (HTTP 422) for a verified webhook payload that deterministic pre-validation proves cannot be stored (U+0000; unpaired surrogate); never produced from database errors, timeouts or unconfirmed commits | ACCEPTED | Task 011; Task 011A RejectionStage amendment; Task 011B code-set amendment |
+| D-028  | Only ACTIVE integrations are eligible for webhook ingestion; DRAFT, DISABLED, DECOMMISSIONED and unregistered integrations receive HTTP 404 after verification, Layer 3 admission and payload pre-validation; a P1/P2 payload receives 422 first; no event and no EVENT_RECEIVED is created; the status is checked under a row lock inside the ingestion transaction | ACCEPTED | Task 011; Task 011A RejectionStage amendment |
 
 Unresolved reference: prisma/schema.prisma refers to decision D-014 (Operation event/endpoint integration consistency check). No D-014 entry exists in this register, and its content cannot presently be reconstructed from this specification or the available repository history; the ID is reserved and must not be reused or assigned by inference. Related discrepancy: Section 13 lists integrationId on Operation, but the current schema has no such column. No design is changed by this note; reconciliation is assigned to a future schema/domain task, to be identified when that task is scoped.
 

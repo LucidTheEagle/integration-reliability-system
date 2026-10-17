@@ -5,6 +5,7 @@ datasource db {
 generator client {
   provider = "prisma-client"
   output   = "../packages/db/src/generated/prisma"
+  importFileExtension = "js"
 }
 
 enum EventState {
@@ -173,6 +174,8 @@ model Event {
   status          EventState
   schemaVersion   String
   correlationId   String?
+  rawBody         Bytes
+  rawBodySha256   String
 
   integration Integration @relation(fields: [integrationId], references: [id], onDelete: Restrict)
   operations  Operation[]

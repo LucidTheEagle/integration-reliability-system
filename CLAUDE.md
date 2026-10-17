@@ -64,6 +64,10 @@ Do not report `pnpm lint` as a successful lint check: no package defined a `lint
 
 **Known fresh-clone typecheck caveat:** `@irs/domain` exports point to `dist`, while its `typecheck` script uses `--noEmit`. A typecheck before the domain package has been built can fail because `dist` is absent. The root `pnpm build` previously passed through workspace dependency ordering, and the test workflow emitted the domain build output. Treat this as known tooling debt; re-check current behaviour and do not silently change scripts as part of an unrelated task.
 
+**Prisma client generation (Task 011).** The generated client (`packages/db/src/generated/prisma`) is gitignored and must exist before `@irs/db` is type-checked or built. `pnpm --filter @irs/db build` generates it first, with `prisma generate --config ../../prisma.generate.config.ts`. That config has no datasource and loads no `.env`, so generation needs no database URL. Always pass an explicit `--config` to Prisma: a bare `prisma` command auto-discovers `prisma7.config.ts`, which loads `.env` and requires `DATABASE_URL`. `prisma7.config.ts` is for `migrate` commands only. As with the domain `dist` caveat, `typecheck` alone can fail on a fresh clone until the client has been generated.
+
+**Database tests (Task 011).** `pnpm test` is database-free: test scripts exclude `*.db.test.js`. Database tests run only through `pnpm --filter @irs/db test:db`, which needs `IRS_TEST_DATABASE_URL` and `IRS_TEST_ADMIN_DATABASE_URL`, fails loudly if either is missing, and refuses any target its guard (`packages/db/src/test-support/guard.ts`) does not accept: only `127.0.0.1:55433` and the registered `irs_011_*_test` databases carrying the sentinel. Never point these variables at `irs_dev` or any shared database. Prisma CLI processes started by the test support (`packages/db/src/test-support/prisma-cli.ts`) run with `CHECKPOINT_DISABLE=1`, so test runs make no Prisma update or telemetry check.
+
 Use the Node and pnpm versions declared by the repository. Do not install, upgrade, or globally reconfigure tools without approval.
 
 ## 7. Task completion report

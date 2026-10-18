@@ -86,6 +86,8 @@ const ALLOWANCE_ELIGIBLE: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
   "NOT_FOUND",
   "PAYLOAD_TOO_LARGE",
   "UNSUPPORTED_MEDIA_TYPE",
+  // Task 011 (B-3, decision D1): the ingestion 422 consumes L2 like the other rejections.
+  "UNPROCESSABLE_PAYLOAD",
 ]);
 
 /** @internal — test seam, not public API */
@@ -95,6 +97,8 @@ export interface ResponseGate {
   peerOf(request: FastifyRequest): PeerKey;
   /** The rejection code if this request consumed L2 allowance (B1). */
   individualRejectionOf(request: FastifyRequest): ApiErrorCode | undefined;
+  /** Task 011 (B-4): the stored event's ID, for response-attempt telemetry only. */
+  noteEventId(request: FastifyRequest, eventId: string): void;
   deliver(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -118,9 +122,55 @@ export function createResponseGate(limiter: RateLimiter): ResponseGate {
   const peers = new WeakMap<FastifyRequest, PeerKey>();
   const aborted = new WeakSet<FastifyRequest>();
   const individualRejections = new WeakMap<FastifyRequest, ApiErrorCode>();
+  const eventIds = new WeakMap<FastifyRequest, string>();
 
   function peerOf(request: FastifyRequest): PeerKey {
     return peers.get(request) ?? limiter.peerKey(request.raw.socket?.remoteAddress);
+  }
+
+  /**
+   * Task 011 (B-4): response-attempt telemetry. One log-only record per
+   * response attempt, written when the outcome is observed. It never
+   * changes, delays or decides a response, never touches the reply, and is
+   * never used for a destroyed reply. FINISH_OBSERVED means Node handed the
+   * response to the connection; it is not proof that the sender received it.
+   */
+  function observeAttempt(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    statusAttempted: number,
+    disposition: string,
+  ): void {
+    try {
+      const raw = reply.raw as Partial<Pick<NodeJS.EventEmitter, "once">> & { writableFinished?: boolean };
+      if (typeof raw.once !== "function") return;
+      let reported = false;
+      const report = (completion: "FINISH_OBSERVED" | "CLOSED_BEFORE_FINISH" | "DELIVERY_ERROR"): void => {
+        if (reported) return;
+        reported = true;
+        try {
+          const eventId = eventIds.get(request);
+          request.log.info(
+            {
+              requestId: request.id,
+              ...(eventId === undefined ? {} : { eventId }),
+              disposition,
+              statusAttempted,
+              completion,
+              responseTimeMs: Math.round(reply.elapsedTime),
+            },
+            "response attempt",
+          );
+        } catch {
+          // Log-only: a failing logger changes nothing.
+        }
+      };
+      raw.once("finish", () => report("FINISH_OBSERVED"));
+      raw.once("close", () => report(raw.writableFinished === true ? "FINISH_OBSERVED" : "CLOSED_BEFORE_FINISH"));
+      raw.once("error", () => report("DELIVERY_ERROR"));
+    } catch {
+      // Telemetry never affects the response.
+    }
   }
 
   /**
@@ -152,6 +202,7 @@ export function createResponseGate(limiter: RateLimiter): ResponseGate {
       }
       return reply;
     }
+    observeAttempt(request, reply, status === 202 ? 202 : statusFor(status), status === 202 ? "ACCEPTED" : status);
     if (extraHeaders !== undefined) {
       for (const [name, value] of Object.entries(extraHeaders)) {
         reply.header(name, value);
@@ -223,6 +274,9 @@ export function createResponseGate(limiter: RateLimiter): ResponseGate {
     },
     peerOf,
     individualRejectionOf: (request) => individualRejections.get(request),
+    noteEventId: (request, eventId) => {
+      eventIds.set(request, eventId);
+    },
     deliver,
     send429,
     rejectWith,
@@ -251,6 +305,100 @@ function codeForRejection(
   }
 }
 
+/** @internal — test seam, not public API (Task 011 DEV-2, B-6). */
+export type DeadlineSettlement =
+  | { readonly kind: "outcome"; readonly outcome: unknown }
+  | { readonly kind: "threw"; readonly error: unknown };
+
+/** @internal — test seam, not public API (Task 011 DEV-2, B-6). */
+export type DeadlineDecision =
+  | DeadlineSettlement
+  | { readonly kind: "deadline"; readonly late: Promise<DeadlineSettlement> };
+
+/**
+ * @internal — test seam, not public API (Task 011 DEV-2, B-6).
+ *
+ * Races a pending handoff against the response deadline under one decision
+ * rule: a settlement is the response only if it is observed while
+ * `remainingMs()` is above zero; otherwise, and when the timer finds no
+ * budget left, the decision is the deadline. Both paths read the clock at
+ * the moment of observation, so a settlement observed after the deadline
+ * takes the late path even if the timer callback has not run yet. A timer
+ * that fires early re-arms for the remainder. The timer is unref'd and
+ * cleared on decision. Neither the result nor `late` ever rejects.
+ */
+export function raceResponseDeadline(
+  pending: Promise<unknown>,
+  remainingMs: () => number,
+): Promise<DeadlineDecision> {
+  const settled: Promise<DeadlineSettlement> = pending.then(
+    (outcome): DeadlineSettlement => ({ kind: "outcome", outcome }),
+    (error: unknown): DeadlineSettlement => ({ kind: "threw", error }),
+  );
+  return new Promise<DeadlineDecision>((resolve) => {
+    let decided = false;
+    let timer: NodeJS.Timeout | undefined;
+    const decide = (decision: DeadlineDecision): void => {
+      decided = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(decision);
+    };
+    const arm = (ms: number): void => {
+      timer = setTimeout(onTimer, ms);
+      timer.unref();
+    };
+    function onTimer(): void {
+      timer = undefined;
+      if (decided) return;
+      const remaining = remainingMs();
+      if (remaining > 0) {
+        arm(remaining);
+        return;
+      }
+      decide({ kind: "deadline", late: settled });
+    }
+    void settled.then((settlement) => {
+      if (decided) return;
+      decide(remainingMs() > 0 ? settlement : { kind: "deadline", late: settled });
+    });
+    const initial = remainingMs();
+    if (initial > 0) arm(initial);
+    else decide({ kind: "deadline", late: settled });
+  });
+}
+
+/** The late-outcome record for a result observed after the deadline response (DEV-2 §2.4). */
+function lateOutcomeFields(settlement: DeadlineSettlement): Record<string, unknown> {
+  if (settlement.kind === "threw") {
+    // The phase of a rejection is attested neither by the error nor by the
+    // handoff contract, so it is never reported as a fault (FD-12).
+    const errorName = settlement.error instanceof Error ? settlement.error.name : undefined;
+    return { late: "UNKNOWN_AFTER_RESPONSE", errorName };
+  }
+  const outcome = settlement.outcome;
+  const status =
+    typeof outcome === "object" && outcome !== null ? (outcome as { status?: unknown }).status : undefined;
+  switch (status) {
+    case "ACCEPTED": {
+      const eventId = (outcome as { eventId?: unknown }).eventId;
+      return { late: "COMMITTED_AFTER_RESPONSE", ...(typeof eventId === "string" ? { eventId } : {}) };
+    }
+    case "UNAVAILABLE": {
+      const classification = (outcome as { classification?: unknown }).classification;
+      return {
+        late: "UNAVAILABLE_AFTER_RESPONSE",
+        handoffClassification:
+          classification === "TRANSIENT" || classification === "COMMIT_UNKNOWN" ? classification : "UNSPECIFIED",
+      };
+    }
+    case "UNPROCESSABLE_PAYLOAD":
+    case "INTEGRATION_INELIGIBLE":
+      return { late: "REJECTED_AFTER_RESPONSE" };
+    default:
+      return { late: "INVALID_OUTCOME" };
+  }
+}
+
 export function buildServer(
   dependencies: ServerDependencies,
   options: ServerOptions = {},
@@ -265,6 +413,9 @@ export function buildServer(
     options.headersTimeoutMs ?? DEFAULT_HEADERS_TIMEOUT_MS,
     requestTimeoutMs,
   );
+  // One budget for Fastify's handlerTimeout and the response deadline
+  // (Task 011 DEV-2). PROVISIONAL (AR-3): 15 s by default.
+  const handlerTimeoutMs = requestTimeoutMs + HANDLER_TIMEOUT_MARGIN_MS;
 
   const app = Fastify({
     logger:
@@ -280,8 +431,11 @@ export function buildServer(
     requestTimeout: requestTimeoutMs,
     // Application-level bound on the whole lifecycle including the
     // ingestion handoff. Kept above the socket-level request timeout so a
-    // stalled upload is ended by that (408) first.
-    handlerTimeout: requestTimeoutMs + HANDLER_TIMEOUT_MARGIN_MS,
+    // stalled upload is ended by that (408) first. Fastify 5.12.5 clears
+    // this timer when the request emits `close`, which Node 24 does once the
+    // body has been read, so it never bounds the handoff; the response
+    // deadline in the handler does (Task 011 DEV-2).
+    handlerTimeout: handlerTimeoutMs,
     keepAliveTimeout: options.keepAliveTimeoutMs ?? DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
     // Node only evaluates request/header timeouts every
     // `connectionsCheckingInterval` (default 30 s); keep it tight so the
@@ -492,38 +646,95 @@ export function buildServer(
       }
       if (!decision.allowed) return gate.send429(request, reply, decision);
 
-      // Outcome contract: ACCEPTED -> 202, UNAVAILABLE -> 503. Anything
-      // else (a thrown error, or an outcome outside the contract) is an
-      // internal fault -> 500. A 2xx is only ever sent for ACCEPTED.
-      let outcome: unknown;
+      // Outcome contract: ACCEPTED -> 202, UNAVAILABLE -> 503,
+      // UNPROCESSABLE_PAYLOAD -> 422, INTEGRATION_INELIGIBLE -> 404 (Task 011,
+      // B-1). Anything else (a thrown error, or an outcome outside the
+      // contract) is an internal fault -> 500. A 2xx is only ever sent for
+      // ACCEPTED.
+      //
+      // Response deadline (Task 011 DEV-2, B-6): an end-to-end limit measured
+      // from routing, the start point of Fastify's own timer (reply.elapsedTime).
+      // At the deadline the 503 goes through the gate, logged UNKNOWN; a result
+      // observed later is logged once and never answered. The deadline neither
+      // cancels the database work nor releases its connection.
+      const remainingMs = (): number => handlerTimeoutMs - reply.elapsedTime;
+      const deadlineResponse = (reason: string, outcome: string): FastifyReply => {
+        request.log.warn(
+          { requestId: request.id, outcome, reason, elapsedMs: Math.round(reply.elapsedTime) },
+          "ingestion response deadline reached",
+        );
+        if (reply.sent) return reply;
+        return gate.rejectWith(request, reply, "SERVICE_UNAVAILABLE");
+      };
+      if (remainingMs() <= 0) {
+        // Nothing was handed off, so nothing can commit later.
+        return deadlineResponse("RESPONSE_DEADLINE_BEFORE_HANDOFF", "NOT_ATTEMPTED");
+      }
+      let pending: Promise<unknown>;
       try {
-        outcome = await dependencies.ingestion.accept({
-          requestId: request.id,
-          integrationId: context.integrationId,
-          envelope: result.envelope,
-          rawBody,
-          receivedAt: context.receivedAt,
-          metadata: {
-            contentType: context.contentType,
-            bodyByteLength: rawBody.byteLength,
-          },
-        });
+        pending = Promise.resolve(
+          dependencies.ingestion.accept({
+            requestId: request.id,
+            integrationId: context.integrationId,
+            envelope: result.envelope,
+            rawBody,
+            receivedAt: context.receivedAt,
+            metadata: {
+              contentType: context.contentType,
+              bodyByteLength: rawBody.byteLength,
+            },
+          }),
+        );
       } catch (error) {
+        pending = Promise.reject(error);
+      }
+      const settlement = await raceResponseDeadline(pending, remainingMs);
+      if (settlement.kind === "deadline") {
+        const decidedAt = performance.now();
+        void settlement.late.then((late) => {
+          try {
+            request.log.warn(
+              { requestId: request.id, lateByMs: Math.round(performance.now() - decidedAt), ...lateOutcomeFields(late) },
+              "late ingestion outcome",
+            );
+          } catch {
+            // Log-only: a failing logger changes nothing.
+          }
+        });
+        return deadlineResponse("RESPONSE_DEADLINE", "UNKNOWN");
+      }
+      if (settlement.kind === "threw") {
         // Name only: messages and stacks may carry sensitive data.
-        const name = error instanceof Error ? error.name : undefined;
+        const name = settlement.error instanceof Error ? settlement.error.name : undefined;
         request.log.error({ errorName: name }, "ingestion handoff failed");
         return gate.rejectWith(request, reply, "INTERNAL_ERROR");
       }
+      const outcome = settlement.outcome;
 
       const status =
         typeof outcome === "object" && outcome !== null
           ? (outcome as { status?: unknown }).status
           : undefined;
       if (status === "ACCEPTED") {
+        const eventId = (outcome as { eventId?: unknown }).eventId;
+        if (typeof eventId === "string") gate.noteEventId(request, eventId);
         return gate.deliver(request, reply, 202);
       }
       if (status === "UNAVAILABLE") {
         return gate.rejectWith(request, reply, "SERVICE_UNAVAILABLE");
+      }
+      if (status === "UNPROCESSABLE_PAYLOAD") {
+        // Task 011 (B-1): a payload with P1/P2, rejected before any ingestion-path
+        // database access. Task 011A supplies its rejection stage
+        // (INGESTION_PAYLOAD, Amendment Note E6) at this call site.
+        return gate.rejectWith(request, reply, "UNPROCESSABLE_PAYLOAD");
+      }
+      if (status === "INTEGRATION_INELIGIBLE") {
+        // Task 011 (B-1): the integration is not ACTIVE, or not registered; only
+        // the status-check read ran and nothing was written. The generic 404.
+        // Task 011A supplies its rejection stage (INGESTION_INTEGRATION,
+        // Amendment Note E7) at this call site.
+        return gate.rejectWith(request, reply, "NOT_FOUND");
       }
       request.log.error("ingestion handoff returned an invalid outcome");
       return gate.rejectWith(request, reply, "INTERNAL_ERROR");

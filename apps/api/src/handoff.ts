@@ -29,14 +29,30 @@ export interface IngestionRequest {
   readonly metadata: IngestionMetadata;
 }
 
+/** Why a handoff answered UNAVAILABLE: a transient failure, or an outcome unknown after the commit boundary. */
+export type UnavailableClassification = "TRANSIENT" | "COMMIT_UNKNOWN";
+
+/** A permanently unstorable payload condition (Task 011, Rev 1.7 §8.4a). */
+export type UnprocessableCondition = "P1_NUL_CHARACTER" | "P2_UNPAIRED_SURROGATE";
+
 /**
  * `ACCEPTED` means the event has been durably accepted. Only a handoff
  * that has durably persisted the event may return it; the transport
- * boundary sends 2xx solely on this outcome.
+ * boundary sends 2xx solely on this outcome. `eventId` is used only by
+ * response-attempt telemetry (C-G4-2).
+ *
+ * `UNPROCESSABLE_PAYLOAD` (→ 422) and `INTEGRATION_INELIGIBLE` (→ 404)
+ * are rejections decided before any write (Task 011, AR-1).
+ *
+ * `UNAVAILABLE` (→ 503) may carry the handoff's own classification
+ * (Task 011 DEV-2, C-G4-2 as amended by FD-12). It never changes the
+ * response; only the late-outcome record reads it.
  */
 export type IngestionOutcome =
-  | { readonly status: "ACCEPTED" }
-  | { readonly status: "UNAVAILABLE" };
+  | { readonly status: "ACCEPTED"; readonly eventId?: string }
+  | { readonly status: "UNAVAILABLE"; readonly classification?: UnavailableClassification }
+  | { readonly status: "UNPROCESSABLE_PAYLOAD"; readonly condition: UnprocessableCondition }
+  | { readonly status: "INTEGRATION_INELIGIBLE" };
 
 /** Injectable boundary to durable ingestion (Task 011). */
 export interface IngestionHandoff {

@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsc -p tsconfig.json && node --test \"dist/**/!(*.db).test.js\"",
+    "test:db": "pnpm --filter @irs/db run build && tsc -p tsconfig.json && node ../../packages/db/dist/test-support/preflight.js && node --test --test-concurrency=1 \"dist/**/*.db.test.js\"",
     "start": "node --env-file-if-exists=../../.env dist/main.js"
   },
   "dependencies": {

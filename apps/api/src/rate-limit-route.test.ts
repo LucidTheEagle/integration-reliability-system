@@ -541,6 +541,37 @@ describe("T8: conversion on every eligible path (inject)", () => {
   }
 });
 
+// Task 011, approved 011B amendment B-5: the ingestion 404 and 422 join the
+// eligible-path conversions. Added alongside T8; the T8 cases above are
+// unchanged (they assert the handoff is never called, which by definition
+// does not hold for a rejection the handoff decides).
+describe("T8 extension (B-5): ingestion 404 and 422 (inject)", () => {
+  const cases = [
+    { name: "ingestion 422 (unstorable payload)", outcome: { status: "UNPROCESSABLE_PAYLOAD", condition: "P1_NUL_CHARACTER" } as const, status: 422, code: "UNPROCESSABLE_PAYLOAD" },
+    { name: "ingestion 404 (ineligible integration)", outcome: { status: "INTEGRATION_INELIGIBLE" } as const, status: 404, code: "NOT_FOUND" },
+  ];
+  for (const c of cases) {
+    it(`${c.name}: individual rejection first, then converted to 429 once L2 is empty`, async () => {
+      const handoff = () => new RecordingHandoff(() => Promise.resolve(c.outcome));
+      const plain = start({ handoff: handoff() });
+      const individual = await post(plain, validRequest());
+      assertGeneric(individual, c.status, c.code);
+      assert.equal(delta(plain).layers.L2.individualRejections, 1);
+
+      const t = start({ handoff: handoff(), stubPeek: true });
+      exhaust(t, "L2");
+      delta(t);
+      const response = await post(t, validRequest());
+      assert429(response, "30");
+      const d = delta(t);
+      assert.equal(d.layers.L2.limitedConverted, 1);
+      assert.equal(d.layers.L2.limited, 1);
+      assert.equal(d.layers.L2.individualRejections, 0);
+      assert.equal(t.handoff.requests.length, 1, "the handoff decided the rejection");
+    });
+  }
+});
+
 describe("T9: 429, 503, 500 and 202 never consume L2", () => {
   const cases: Array<{
     name: string;

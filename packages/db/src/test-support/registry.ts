@@ -76,6 +76,41 @@ export const SCRATCH_PURPOSES: readonly ScratchPurpose[] = [
     description: "MIG-T1: migrate deploy into an empty database, then catalog checks",
     sentinelRoles: [],
   },
+  {
+    purpose: "rdt1",
+    description: "RD-T1: readiness on an empty database, then on tables without a ledger",
+    sentinelRoles: [API_ROLE],
+  },
+  {
+    purpose: "ledger",
+    description: "RD-T2/T3/T5: readiness against manipulated migration-ledger rows",
+    sentinelRoles: [API_ROLE],
+  },
+  {
+    purpose: "rdt4",
+    description: "RD-T4: readiness after a deliberately failing migration",
+    sentinelRoles: [API_ROLE],
+  },
+  {
+    purpose: "structure",
+    description: "RD-T6: readiness against altered structures (S2–S5, the S3 function)",
+    sentinelRoles: [API_ROLE],
+  },
+  {
+    purpose: "s1",
+    description: "RD-T6a–p: readiness against substitute idempotency indexes and collations",
+    sentinelRoles: [API_ROLE],
+  },
+  {
+    purpose: "decoy",
+    description: "DB-T1/V2: ingestion with a decoy schema first on the search_path",
+    sentinelRoles: [API_ROLE],
+  },
+  {
+    purpose: "lock",
+    description: "AL-T7e/AL-T9/AL-T11: a probe table for advisory-lock tests",
+    sentinelRoles: [API_ROLE],
+  },
 ];
 
 export function scratchDatabaseName(purpose: string): string {

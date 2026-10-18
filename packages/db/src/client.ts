@@ -79,6 +79,8 @@ export function toPgPoolConfig(connectionString: string, settings: PoolSettings)
 export interface Database {
   /** The generated client, for repositories in `@irs/db` and Task 011A's store. */
   readonly prisma: PrismaClient;
+  /** The monotonic clock (ms) that withAdvisoryXactLock deadlines are measured on. */
+  readonly monotonicNow: () => number;
   /** `SELECT 1`. */
   ping(): Promise<void>;
 }
@@ -86,6 +88,8 @@ export interface Database {
 export interface CreateDatabaseOptions {
   readonly connectionString: string;
   readonly pool?: Partial<PoolSettings>;
+  /** Default `performance.now`. */
+  readonly monotonicNow?: () => number;
 }
 
 /** Builds the client and its pool. Performs no I/O: the pool connects lazily. */
@@ -95,8 +99,38 @@ export function createDatabase(options: CreateDatabaseOptions): Database {
   const prisma = new PrismaClient({ adapter });
   return {
     prisma,
+    monotonicNow: options.monotonicNow ?? (() => performance.now()),
     async ping(): Promise<void> {
       await prisma.$queryRaw`SELECT 1`;
     },
   };
+}
+
+export type DisconnectOutcome =
+  | { readonly completed: true }
+  | { readonly completed: false; readonly timedOut: true };
+
+/** The approved disconnect bound (TD-13, F-7). */
+export const DISCONNECT_TIMEOUT_MS = 5_000;
+
+/**
+ * Disconnects, waiting at most `timeoutMs`. Never rejects. A disconnect that
+ * rejects is reported as not completed: the closed outcome type has no
+ * separate failure variant.
+ */
+export async function disconnectWithin(db: Database, timeoutMs: number): Promise<DisconnectOutcome> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<DisconnectOutcome>((resolve) => {
+    timer = setTimeout(() => resolve({ completed: false, timedOut: true }), timeoutMs);
+    timer.unref();
+  });
+  const disconnected = db.prisma.$disconnect().then(
+    (): DisconnectOutcome => ({ completed: true }),
+    (): DisconnectOutcome => ({ completed: false, timedOut: true }),
+  );
+  try {
+    return await Promise.race([disconnected, timedOut]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

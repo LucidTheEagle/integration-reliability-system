@@ -40,10 +40,18 @@ function redact(text: string, urls: readonly string[]): string {
   return urls.reduce((result, url) => result.split(url).join("<test-database-url>"), text);
 }
 
+/**
+ * `childEnv` holds test-database URLs only; each is checked by the guard.
+ * `extraEnv` holds non-URL values (for example a migrations directory).
+ */
 export async function runPrismaCli(
   args: readonly string[],
   childEnv: Readonly<Record<string, string>>,
+  extraEnv: Readonly<Record<string, string>> = {},
 ): Promise<PrismaRun> {
+  for (const value of Object.values(extraEnv)) {
+    if (/^postgres(ql)?:/i.test(value)) throw new Error("URLs belong in childEnv, where the guard checks them");
+  }
   if (!args.includes("--config")) {
     throw new Error("every Prisma command takes an explicit --config");
   }
@@ -57,7 +65,9 @@ export async function runPrismaCli(
   delete env["DATABASE_URL"];
   delete env["IRS_DRIFT_DATASOURCE_URL"];
   delete env["IRS_DRIFT_SHADOW_DATABASE_URL"];
-  Object.assign(env, childEnv);
+  delete env["IRS_PROBE_DATASOURCE_URL"];
+  delete env["IRS_PROBE_MIGRATIONS_DIR"];
+  Object.assign(env, extraEnv, childEnv);
   // FD-5: no Prisma update or telemetry check from test runs.
   env["CHECKPOINT_DISABLE"] = "1";
 

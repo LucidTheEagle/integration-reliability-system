@@ -51,6 +51,44 @@ export async function grantProblems(client: PgClient): Promise<string[]> {
   return problems;
 }
 
+/**
+ * Applies the function owner and the registry grants to a migrated scratch
+ * database (admin mode), mirroring the irs_011_test provisioning for the
+ * given roles, plus any test-specific statements.
+ */
+export async function grantScratch(
+  scratchUrl: string,
+  roles: readonly string[],
+  extraStatements: readonly string[] = [],
+): Promise<void> {
+  const scratch = await connectGuarded({ url: scratchUrl, mode: "admin", applicationName: "irs-test-scratch-grants" });
+  try {
+    await scratch.client.query("BEGIN");
+    await scratch.client.query(`ALTER FUNCTION ${STATUS_FUNCTION_SIGNATURE} OWNER TO "${LOCK_OWNER_ROLE}"`);
+    for (const role of [LOCK_OWNER_ROLE, ...roles]) {
+      for (const grant of APPLICATION_GRANTS[role] ?? []) await scratch.client.query(grantStatement(grant, role));
+    }
+    for (const statement of extraStatements) await scratch.client.query(statement);
+    await scratch.client.query("COMMIT");
+  } catch (error) {
+    await scratch.client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    await scratch.close();
+  }
+}
+
+/** migrate deploy of the committed migrations into a scratch database (P4), then grantScratch. */
+export async function migrateScratch(
+  scratchUrl: string,
+  roles: readonly string[],
+  extraStatements: readonly string[] = [],
+): Promise<void> {
+  const deploy = await runPrismaCli(["migrate", "deploy", "--config", "prisma7.config.ts"], { DATABASE_URL: scratchUrl });
+  if (deploy.exitCode !== 0) throw new Error(`migrate deploy into scratch failed: ${deploy.stderr}`);
+  await grantScratch(scratchUrl, roles, extraStatements);
+}
+
 export async function provision(adminUrl: string): Promise<string[]> {
   const evidence: string[] = [];
   const admin = await connectGuarded({ url: adminUrl, mode: "admin", applicationName: "irs-test-provision" });

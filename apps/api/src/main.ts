@@ -1,17 +1,28 @@
 import { ConfigValidationError } from "@irs/config";
+import { DISCONNECT_TIMEOUT_MS, classifyDatabaseError, disconnectWithin, verifySchemaReadiness } from "@irs/db";
+import { DEFAULT_LIFECYCLE_BUDGETS, retryingReadiness, runApi, terminate } from "./lifecycle.js";
+import type { LifecycleLogger, LifecycleSteps, SignalSource } from "./lifecycle.js";
 import { createProductionServer } from "./production.js";
+import type { ProductionServer } from "./production.js";
 import { LISTEN_HOST, closeWithGrace } from "./server.js";
 
-/** Maximum time to wait for in-flight requests on shutdown. */
+/** Maximum time to wait for in-flight requests on shutdown (D1). */
 const SHUTDOWN_GRACE_MS = 10_000;
 
+const processSignals: SignalSource = {
+  subscribe(listener) {
+    process.on("SIGINT", () => listener("SIGINT"));
+    process.on("SIGTERM", () => listener("SIGTERM"));
+  },
+};
+
 async function main(): Promise<void> {
-  let server;
+  let server: ProductionServer;
   try {
     server = createProductionServer();
   } catch (error) {
     if (error instanceof ConfigValidationError) {
-      // Messages are value-free by construction.
+      // Messages are value-free by construction; no database was created.
       process.stderr.write(`${error.message}\n`);
       process.exitCode = 1;
       return;
@@ -19,25 +30,43 @@ async function main(): Promise<void> {
     throw error;
   }
 
-  const { app, port } = server;
-
-  let shuttingDown = false;
-  const shutdown = (signal: string): void => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    app.log.info({ signal }, "shutting down");
-    closeWithGrace(app, SHUTDOWN_GRACE_MS)
-      .then(() => {
-        process.exitCode = 0;
-      })
-      .catch(() => {
-        process.exitCode = 1;
-      });
+  const { app, port, db } = server;
+  const steps: LifecycleSteps = {
+    verifyReadiness: retryingReadiness(() => verifySchemaReadiness(db), {
+      isConnectivityError: (error) => classifyDatabaseError(error).failureClass === "TRANSIENT",
+    }),
+    startupSlot: async () => undefined, // SLOT A: Task 011A.
+    verifyRegistration: async () => ({ kind: "STILL_UNKNOWN" }), // SLOT A′: Task 011A; never reached.
+    listen: async () => {
+      await app.listen({ host: LISTEN_HOST, port });
+    },
+    intakeBarrier: async () => {
+      await closeWithGrace(app, SHUTDOWN_GRACE_MS);
+      return { forced: "NOT_REPORTED" };
+    },
+    finalizeBeforeDisconnect: async () => ({ successAllowed: true }), // SLOT B: Task 011A.
+    disconnect: () => disconnectWithin(db, DISCONNECT_TIMEOUT_MS),
+    budgets: DEFAULT_LIFECYCLE_BUDGETS,
   };
-  process.once("SIGINT", () => shutdown("SIGINT"));
-  process.once("SIGTERM", () => shutdown("SIGTERM"));
 
-  await app.listen({ host: LISTEN_HOST, port });
+  // FastifyBaseLogger's type omits pino's flush, which exists at runtime; terminate() needs it
+  // for the bounded flush before a forced exit.
+  const pinoLog = app.log as typeof app.log & { flush?: (callback: (error?: Error) => void) => void };
+  const logger: LifecycleLogger = {
+    error: (object, message) => pinoLog.error(object, message),
+    warn: (object, message) => pinoLog.warn(object, message),
+    ...(typeof pinoLog.flush === "function"
+      ? { flush: (callback?: (error?: Error) => void) => pinoLog.flush?.(callback ?? (() => undefined)) }
+      : {}),
+  };
+
+  const result = await runApi(steps, processSignals, { logger });
+  const primary = result.failures[0];
+  if (primary?.step === "READINESS") {
+    // The reason code (and assertion ID) only; never connection details.
+    process.stderr.write(`Readiness failed: ${primary.errorCode ?? primary.errorName ?? primary.kind}\n`);
+  }
+  terminate(result, logger);
 }
 
 main().catch((error: unknown) => {

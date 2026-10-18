@@ -17,6 +17,7 @@ export type ApiErrorCode =
   | "REQUEST_TIMEOUT"
   | "PAYLOAD_TOO_LARGE"
   | "UNSUPPORTED_MEDIA_TYPE"
+  | "UNPROCESSABLE_PAYLOAD"
   | "TOO_MANY_REQUESTS"
   | "SERVICE_UNAVAILABLE"
   | "INTERNAL_ERROR";
@@ -28,6 +29,8 @@ const STATUS: Readonly<Record<ApiErrorCode, number>> = {
   REQUEST_TIMEOUT: 408,
   PAYLOAD_TOO_LARGE: 413,
   UNSUPPORTED_MEDIA_TYPE: 415,
+  // Task 011 (B-2): a payload PostgreSQL can never store (P1/P2); an unchanged retry fails identically.
+  UNPROCESSABLE_PAYLOAD: 422,
   TOO_MANY_REQUESTS: 429,
   SERVICE_UNAVAILABLE: 503,
   INTERNAL_ERROR: 500,

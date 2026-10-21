@@ -377,3 +377,21 @@ model AuditEntry {
   @@index([entityType, entityId])
   @@index([createdAt])
 }
+
+model RateLimitEvidence {
+  id                String   @id @db.Uuid
+  limiterInstanceId String   @db.Uuid
+  scope             String
+  kind              String
+  gapReason         String?
+  firstSequence     Int?
+  lastSequence      Int?
+  missingFrom       Int?
+  missingTo         Int?
+  payload           Json
+  recordSha256      String
+  recordedAt        DateTime @db.Timestamptz(3)
+
+  @@index([scope, kind])
+  @@index([limiterInstanceId])
+}

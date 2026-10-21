@@ -101,7 +101,7 @@ describe("readiness on irs_011_test", () => {
       const allowed = await db.prisma.$queryRawUnsafe<unknown[]>(
         `SELECT "migration_name", "finished_at", "rolled_back_at" FROM "public"."_prisma_migrations"`,
       );
-      assert.equal(allowed.length, 1);
+      assert.equal(allowed.length, REQUIRED_MIGRATIONS.length);
     } finally {
       await db.prisma.$disconnect();
     }
@@ -198,14 +198,18 @@ describe("RD-T2 / RD-T3 / RD-T5: ledger states", () => {
       await migrateScratch(adminScratchUrl, [API_ROLE]);
       assert.deepEqual(await readiness(apiScratchUrl), { ready: true });
 
-      const original = (await scratch.client.query(`SELECT * FROM "public"."_prisma_migrations"`)).rows[0] as Record<string, unknown>;
+      // Task 011A (RD-4a): save and restore every ledger row, not only the first.
+      const originals = (await scratch.client.query(`SELECT * FROM "public"."_prisma_migrations" ORDER BY "migration_name"`))
+        .rows as Record<string, unknown>[];
       await scratch.client.query(`DELETE FROM "public"."_prisma_migrations"`);
       assert.deepEqual(await readiness(apiScratchUrl), { ready: false, reason: "MIGRATION_MISSING" });
-      await scratch.client.query(
-        `INSERT INTO "public"."_prisma_migrations" ("id", "checksum", "finished_at", "migration_name", "logs", "rolled_back_at", "started_at", "applied_steps_count")
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [original.id, original.checksum, original.finished_at, original.migration_name, original.logs, original.rolled_back_at, original.started_at, original.applied_steps_count],
-      );
+      for (const original of originals) {
+        await scratch.client.query(
+          `INSERT INTO "public"."_prisma_migrations" ("id", "checksum", "finished_at", "migration_name", "logs", "rolled_back_at", "started_at", "applied_steps_count")
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [original.id, original.checksum, original.finished_at, original.migration_name, original.logs, original.rolled_back_at, original.started_at, original.applied_steps_count],
+        );
+      }
 
       await scratch.client.query(`UPDATE "public"."_prisma_migrations" SET "rolled_back_at" = now()`);
       assert.deepEqual(await readiness(apiScratchUrl), { ready: false, reason: "MIGRATION_MISSING" });
@@ -453,6 +457,57 @@ describe("RD-T6a–p: S1 against substitute idempotency indexes", () => {
       }
       assert.deepEqual(await readiness(apiScratchUrl), { ready: true }, "restored");
       assert.ok(readdirSync(MIGRATION_DIR).includes(INIT));
+    });
+  });
+});
+
+describe("RD-7 (Task 011A): RateLimitEvidence table, primary key and natural-key indexes", () => {
+  it("positive: irs_011_test, with both migrations, is ready: true as irs_test_api", async () => {
+    assert.deepEqual(await readiness(apiUrl), { ready: true });
+  });
+
+  it("negatives in a registered scratch database: each index missing, non-unique or with a wrong predicate; the primary key; the table — each fails closed with its own assertion", async () => {
+    await withScratch("rle", async (scratch, apiScratchUrl, adminScratchUrl) => {
+      await migrateScratch(adminScratchUrl, [API_ROLE]);
+      assert.deepEqual(await readiness(apiScratchUrl), { ready: true }, "positive before any alteration");
+      const table = `"public"."RateLimitEvidence"`;
+      // The A14 §7.4 definitions, schema-qualified, used to restore each index.
+      const indexes: [string, string, string, string][] = [
+        ["RLE.lifecycle_uq", "rle_instance_lifecycle_uq", `("limiterInstanceId", "kind")`, `"kind" IN ('INSTANCE_STARTED', 'INSTANCE_CLOSED')`],
+        ["RLE.summary_range_uq", "rle_summary_range_uq", `("limiterInstanceId", "firstSequence", "lastSequence")`, `"kind" = 'SUMMARY'`],
+        ["RLE.gap_discontinuity_uq", "rle_gap_discontinuity_uq", `("limiterInstanceId", "missingFrom", "missingTo")`, `"kind" = 'EVIDENCE_GAP' AND "gapReason" = 'SEQUENCE_DISCONTINUITY'`],
+        ["RLE.gap_unclean_uq", "rle_gap_unclean_uq", `("limiterInstanceId")`, `"kind" = 'EVIDENCE_GAP' AND "gapReason" = 'UNCLEAN_TERMINATION'`],
+      ];
+      for (const [assertion, name, columns, predicate] of indexes) {
+        const restore = `CREATE UNIQUE INDEX "${name}" ON ${table} ${columns} WHERE ${predicate}`;
+        const variants: [string, string[]][] = [
+          ["missing", []],
+          ["non-unique", [`CREATE INDEX "${name}" ON ${table} ${columns} WHERE ${predicate}`]],
+          ["wrong predicate", [`CREATE UNIQUE INDEX "${name}" ON ${table} ${columns} WHERE "kind" = 'OTHER'`]],
+        ];
+        for (const [label, create] of variants) {
+          // Admin mode, scratch only: an out-of-band alteration of the index.
+          await scratch.client.query(`DROP INDEX "public"."${name}"`);
+          try {
+            for (const statement of create) await scratch.client.query(statement);
+            assert.deepEqual(await readiness(apiScratchUrl), STRUCTURE(assertion), `${name} ${label}`);
+          } finally {
+            await scratch.client.query(`DROP INDEX IF EXISTS "public"."${name}"`);
+            await scratch.client.query(restore);
+          }
+          assert.deepEqual(await readiness(apiScratchUrl), { ready: true }, `restored after ${name} ${label}`);
+        }
+      }
+      await scratch.client.query(`ALTER TABLE ${table} DROP CONSTRAINT "RateLimitEvidence_pkey"`);
+      try {
+        assert.deepEqual(await readiness(apiScratchUrl), STRUCTURE("RLE.pk"), "primary key missing");
+      } finally {
+        await scratch.client.query(`ALTER TABLE ${table} ADD CONSTRAINT "RateLimitEvidence_pkey" PRIMARY KEY ("id")`);
+      }
+      assert.deepEqual(await readiness(apiScratchUrl), { ready: true }, "restored after the primary key");
+      // Last: the table itself. The scratch database is dropped afterwards.
+      await scratch.client.query(`DROP TABLE ${table}`);
+      assert.deepEqual(await readiness(apiScratchUrl), STRUCTURE("RLE.table"), "table missing");
     });
   });
 });

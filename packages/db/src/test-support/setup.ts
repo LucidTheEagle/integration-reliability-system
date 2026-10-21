@@ -1,14 +1,16 @@
-import { mkdirSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { bootstrapMain, bootstrapShadow } from "./bootstrap.js";
 import { collectEvidence } from "./evidence.js";
-import { connectGuarded, requireTestUrl } from "./guard.js";
+import { connectGuarded, requireTestUrl, withDatabase } from "./guard.js";
 import { REPO_ROOT, runPrismaCli } from "./prisma-cli.js";
 import { provision } from "./provision.js";
+import { SHADOW_DATABASE } from "./registry.js";
 
 // Test-database setup CLI (run by hand, never by tests):
 //   node dist/test-support/setup.js bootstrap
 //   node dist/test-support/setup.js author prisma/migrations/<dir>/migration.sql
+//   node dist/test-support/setup.js author-next prisma/migrations/<dir>/migration.sql
 //   node dist/test-support/setup.js provision
 //   node dist/test-support/setup.js evidence
 
@@ -50,6 +52,52 @@ async function author(relativePath: string | undefined): Promise<void> {
   process.stdout.write(`[author] wrote ${relativePath} (${run.stdout.length} chars)\n`);
 }
 
+const NEXT_MIGRATION_PATH = /^prisma\/migrations\/(\d{14})_([a-z0-9_]+)\/migration\.sql$/;
+
+/**
+ * Authors a later migration (Task 011A, RD-4): the difference between the
+ * committed history, replayed into the dedicated shadow database, and the
+ * schema. Through P4 with the drift config; the `_init` path above is unchanged.
+ * Raw SQL is appended to the written file by hand afterwards.
+ */
+async function authorNext(relativePath: string | undefined): Promise<void> {
+  const match = relativePath === undefined ? null : NEXT_MIGRATION_PATH.exec(relativePath);
+  if (relativePath === undefined || match === null || match[2] === "init") {
+    throw new Error("usage: author-next prisma/migrations/<YYYYMMDDHHMMSS>_<name>/migration.sql (not _init)");
+  }
+  const target = join(REPO_ROOT, relativePath);
+  if (existsSync(dirname(target))) throw new Error(`${dirname(relativePath)} already exists; not overwriting`);
+  const timestamp = match[1] ?? "";
+  const existing = readdirSync(join(REPO_ROOT, "prisma", "migrations"), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  if (existing.some((name) => name.slice(0, 14) >= timestamp)) {
+    throw new Error("the timestamp must be later than every existing migration");
+  }
+  const adminUrl = requireTestUrl("IRS_TEST_ADMIN_DATABASE_URL");
+  const run = await runPrismaCli(
+    [
+      "migrate",
+      "diff",
+      "--from-migrations",
+      "prisma/migrations",
+      "--to-schema",
+      "prisma/schema.prisma",
+      "--script",
+      "--config",
+      "packages/db/src/test-support/prisma.drift.config.ts",
+    ],
+    { IRS_DRIFT_DATASOURCE_URL: adminUrl, IRS_DRIFT_SHADOW_DATABASE_URL: withDatabase(adminUrl, SHADOW_DATABASE) },
+  );
+  process.stdout.write(`[author-next] exit ${run.exitCode}; stderr: ${run.stderr.trim()}\n`);
+  if (run.exitCode !== 0 || run.stdout.trim() === "" || /empty migration/i.test(run.stdout)) {
+    throw new Error("migrate diff produced no migration");
+  }
+  mkdirSync(dirname(target));
+  writeFileSync(target, run.stdout);
+  process.stdout.write(`[author-next] wrote ${relativePath} (${run.stdout.length} chars)\n`);
+}
+
 async function main(): Promise<void> {
   const [command, argument] = process.argv.slice(2);
   switch (command) {
@@ -57,6 +105,8 @@ async function main(): Promise<void> {
       return bootstrap();
     case "author":
       return author(argument);
+    case "author-next":
+      return authorNext(argument);
     case "provision": {
       const evidence = await provision(requireTestUrl("IRS_TEST_ADMIN_DATABASE_URL"));
       for (const line of evidence) process.stdout.write(`[provision] ${line}\n`);
@@ -66,7 +116,7 @@ async function main(): Promise<void> {
       process.stdout.write(`${await collectEvidence(requireTestUrl("IRS_TEST_ADMIN_DATABASE_URL"))}\n`);
       return;
     default:
-      throw new Error("usage: setup.js bootstrap | author <path> | provision | evidence");
+      throw new Error("usage: setup.js bootstrap | author <path> | author-next <path> | provision | evidence");
   }
 }
 

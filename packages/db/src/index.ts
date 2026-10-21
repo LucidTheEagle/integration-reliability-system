@@ -54,3 +54,27 @@ export {
   withAdvisoryXactLock,
 } from "./advisory-lock.js";
 export type { AdvisoryLockKey, LockedTransactionOptions } from "./advisory-lock.js";
+
+// Task 011A evidence-store primitives (addendum RD-2).
+export {
+  EVIDENCE_MAX_WAIT_MS,
+  findEvidenceRecoveryCandidates,
+  readEvidenceDurableState,
+  readEvidenceRegistration,
+  validateEvidenceHistoricalGap,
+  writeEvidenceGroup,
+  writeEvidenceUncleanGap,
+} from "./rate-limit-evidence-store.js";
+export type {
+  EvidenceDurableState,
+  EvidenceGapVerdict,
+  EvidenceJson,
+  EvidencePrimitive,
+  EvidenceRecordRow,
+  EvidenceRecoveryCandidate,
+  EvidenceRegistrationRead,
+  EvidenceStoreHooks,
+  EvidenceWriteResult,
+} from "./rate-limit-evidence-store.js";
+export { writeRejectionAuditRows } from "./rejection-audit-store.js";
+export type { RejectionAuditRow } from "./rejection-audit-store.js";

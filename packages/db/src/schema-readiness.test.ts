@@ -2,7 +2,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { REQUIRED_MIGRATIONS, STATUS_FUNCTION_BODY, evaluateReadiness } from "./schema-readiness.js";
+import {
+  RATE_LIMIT_EVIDENCE_INDEXES,
+  REQUIRED_MIGRATIONS,
+  STATUS_FUNCTION_BODY,
+  evaluateReadiness,
+} from "./schema-readiness.js";
 import type { ReadinessObservations, ReadinessQueryId } from "./schema-readiness.js";
 
 // Readiness evaluation without a database: injected catalog rows (RD-T6l′,
@@ -87,6 +92,27 @@ const UNIQUE_KEYS: Row[] = [
   },
 ];
 
+/** The intact Task 011A RD-7 observations: the four natural-key indexes plus the table's other indexes. */
+const RLE_INDEX_FLAGS: Row = { indisunique: true, indisvalid: true, indisready: true, indislive: true, indimmediate: true };
+const RLE_INDEXES: Row[] = [
+  ...Object.values(RATE_LIMIT_EVIDENCE_INDEXES).map((indexdef) => ({
+    index_name: /^CREATE UNIQUE INDEX (\S+) /.exec(indexdef)?.[1],
+    indexdef,
+    ...RLE_INDEX_FLAGS,
+  })),
+  {
+    index_name: "RateLimitEvidence_pkey",
+    indexdef: `CREATE UNIQUE INDEX "RateLimitEvidence_pkey" ON public."RateLimitEvidence" USING btree (id)`,
+    ...RLE_INDEX_FLAGS,
+  },
+  {
+    index_name: "RateLimitEvidence_scope_kind_idx",
+    indexdef: `CREATE INDEX "RateLimitEvidence_scope_kind_idx" ON public."RateLimitEvidence" USING btree (scope, kind)`,
+    ...RLE_INDEX_FLAGS,
+    indisunique: false,
+  },
+];
+
 function good(): Map<ReadinessQueryId, readonly Row[]> {
   return new Map<ReadinessQueryId, readonly Row[]>([
     ["S6.b", [{ tt: "0" }]],
@@ -131,6 +157,10 @@ function good(): Map<ReadinessQueryId, readonly Row[]> {
     ["S5", [{ pk_columns: ["id"] }]],
     ["S6.a", [{ server_version_num: 170011 }]],
     ["S6.c", []],
+    // Task 011A RD-7 (RD-4a): the intact RateLimitEvidence observations.
+    ["RLE.table", [{ table_exists: true }]],
+    ["RLE.pk", [{ pk_columns: ["id"] }]],
+    ["RLE.indexes", RLE_INDEXES],
   ]);
 }
 
@@ -171,7 +201,7 @@ describe("readiness evaluation", () => {
     assert.deepEqual(
       evaluateReadiness(
         withRows("L2", [
-          { migration_name: required, finished: true, rolled_back: false },
+          ...REQUIRED_MIGRATIONS.map((name) => ({ migration_name: name, finished: true, rolled_back: false })),
           { migration_name: "29990101000000_later", finished: true, rolled_back: false },
         ]),
       ),
@@ -288,6 +318,79 @@ describe("readiness evaluation", () => {
 
   it("RD-T8d: a readiness query error (no S6.c observation) → SESSION_INVARIANT", () => {
     assert.deepEqual(evaluateReadiness(withRows("S6.c", undefined)), { ready: false, reason: "SESSION_INVARIANT", assertion: "S6.c" });
+  });
+});
+
+describe("RD-7 (Task 011A): RateLimitEvidence table, primary key and natural-key indexes", () => {
+  const structure = (assertion: string) => ({ ready: false, reason: "STRUCTURE_MISMATCH", assertion });
+  const assertions = Object.keys(RATE_LIMIT_EVIDENCE_INDEXES);
+  const withoutIndex = (name: string) => RLE_INDEXES.filter((index) => index.indexdef !== RATE_LIMIT_EVIDENCE_INDEXES[name as keyof typeof RATE_LIMIT_EVIDENCE_INDEXES]);
+  const patchIndex = (name: string, patch: Row) =>
+    RLE_INDEXES.map((index) =>
+      index.indexdef === RATE_LIMIT_EVIDENCE_INDEXES[name as keyof typeof RATE_LIMIT_EVIDENCE_INDEXES] ? { ...index, ...patch } : index,
+    );
+
+  it("a missing or unreadable table fails closed as RLE.table", () => {
+    assert.deepEqual(evaluateReadiness(withRows("RLE.table", [{ table_exists: false }])), structure("RLE.table"));
+    assert.deepEqual(evaluateReadiness(withRows("RLE.table", [])), structure("RLE.table"));
+    assert.deepEqual(evaluateReadiness(withRows("RLE.table", undefined)), structure("RLE.table"));
+  });
+
+  it("a missing, unreadable or wrong primary key fails closed as RLE.pk", () => {
+    for (const rows of [[{ pk_columns: null }], [{ pk_columns: ["scope"] }], [{ pk_columns: ["id", "scope"] }], undefined]) {
+      assert.deepEqual(evaluateReadiness(withRows("RLE.pk", rows)), structure("RLE.pk"), JSON.stringify(rows));
+    }
+  });
+
+  it("each natural-key index: missing, non-unique, wrong predicate or not usable → its own assertion", () => {
+    for (const name of assertions) {
+      const expected = structure(name);
+      const definition = RATE_LIMIT_EVIDENCE_INDEXES[name as keyof typeof RATE_LIMIT_EVIDENCE_INDEXES];
+      assert.deepEqual(evaluateReadiness(withRows("RLE.indexes", withoutIndex(name))), expected, `${name} missing`);
+      const nonUnique = definition.replace("CREATE UNIQUE INDEX", "CREATE INDEX");
+      assert.deepEqual(
+        evaluateReadiness(withRows("RLE.indexes", patchIndex(name, { indexdef: nonUnique, indisunique: false }))),
+        expected,
+        `${name} non-unique`,
+      );
+      const wrongPredicate = definition.replace(/ WHERE .*$/, " WHERE (kind = 'OTHER'::text)");
+      assert.deepEqual(
+        evaluateReadiness(withRows("RLE.indexes", patchIndex(name, { indexdef: wrongPredicate }))),
+        expected,
+        `${name} wrong predicate`,
+      );
+      for (const flag of ["indisunique", "indisvalid", "indisready", "indislive", "indimmediate"]) {
+        assert.deepEqual(evaluateReadiness(withRows("RLE.indexes", patchIndex(name, { [flag]: false }))), expected, `${name} ${flag}`);
+      }
+    }
+  });
+
+  it("an equivalent index under another name fails closed (the golden text includes the name)", () => {
+    const [first] = assertions;
+    const definition = RATE_LIMIT_EVIDENCE_INDEXES[first as keyof typeof RATE_LIMIT_EVIDENCE_INDEXES];
+    const renamed = definition.replace(/^CREATE UNIQUE INDEX \S+ /, "CREATE UNIQUE INDEX irs_renamed ");
+    assert.deepEqual(evaluateReadiness(withRows("RLE.indexes", patchIndex(first ?? "", { indexdef: renamed }))), structure(first ?? ""));
+  });
+
+  it("an unreadable index observation fails closed at the first index assertion", () => {
+    assert.deepEqual(evaluateReadiness(withRows("RLE.indexes", undefined)), structure(assertions[0] ?? ""));
+  });
+
+  it("RD-7 is evaluated last: an existing failure keeps its own reason when the RD-7 observations are also absent", () => {
+    const noRle = (map: ReadinessObservations) => {
+      const copy = new Map(map);
+      for (const id of ["RLE.table", "RLE.pk", "RLE.indexes"] as const) copy.delete(id);
+      return copy;
+    };
+    assert.deepEqual(evaluateReadiness(noRle(withRows("S2", [{ fk_count: 0 }]))), structure("S2"));
+    assert.deepEqual(evaluateReadiness(noRle(patchRow("S3.function", 0, { can_execute: false }))), structure("S3"));
+    assert.deepEqual(evaluateReadiness(noRle(withRows("S6.c", [{ setconfig: ["transaction_timeout=60s"] }]))), {
+      ready: false,
+      reason: "SESSION_INVARIANT",
+      assertion: "S6.c",
+    });
+    assert.deepEqual(evaluateReadiness(noRle(withRows("L2", []))), { ready: false, reason: "MIGRATION_MISSING" });
+    assert.deepEqual(evaluateReadiness(noRle(good())), structure("RLE.table"));
   });
 });
 

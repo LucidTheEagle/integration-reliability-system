@@ -12,9 +12,28 @@ import { Prisma } from "./generated/prisma/client.js";
 export const EXPECTED_SCHEMA = "public";
 
 /** Every migration this build requires; Task 011A appends its own (RD-T7). */
-export const REQUIRED_MIGRATIONS: readonly string[] = Object.freeze(["20261017101850_init"]);
+export const REQUIRED_MIGRATIONS: readonly string[] = Object.freeze([
+  "20261017101850_init",
+  "20261021144921_rate_limit_evidence",
+]);
 
-export type StructureAssertion = "S1" | "S2" | "S3" | "S4" | "S5";
+/**
+ * S1 – S5 (Task 011), and the Task 011A RD-7 assertions for
+ * "RateLimitEvidence": the table, its `id` primary key and its four
+ * natural-key partial unique indexes.
+ */
+export type StructureAssertion =
+  | "S1"
+  | "S2"
+  | "S3"
+  | "S4"
+  | "S5"
+  | "RLE.table"
+  | "RLE.pk"
+  | "RLE.lifecycle_uq"
+  | "RLE.summary_range_uq"
+  | "RLE.gap_discontinuity_uq"
+  | "RLE.gap_unclean_uq";
 export type SessionAssertion = "S6.a" | "S6.b" | "S6.c";
 
 export type SchemaReadiness =
@@ -35,9 +54,31 @@ export type ReadinessQueryId =
   | "S4"
   | "S5"
   | "S6.a"
-  | "S6.c";
+  | "S6.c"
+  | "RLE.table"
+  | "RLE.pk"
+  | "RLE.indexes";
 
 type Row = Record<string, unknown>;
+
+type RateLimitEvidenceIndexAssertion = Extract<StructureAssertion, `RLE.${string}_uq`>;
+
+/**
+ * RD-7: the golden pg_get_indexdef() text of the four natural-key indexes
+ * (A14 §7.4; Task 011A migration), captured once from PostgreSQL 17 after
+ * the migration was applied and changed only by deliberate review. The text
+ * encodes uniqueness, the key columns and the predicate. M2 pins the same text.
+ */
+export const RATE_LIMIT_EVIDENCE_INDEXES: Readonly<Record<RateLimitEvidenceIndexAssertion, string>> = Object.freeze({
+  "RLE.lifecycle_uq":
+    `CREATE UNIQUE INDEX rle_instance_lifecycle_uq ON public."RateLimitEvidence" USING btree ("limiterInstanceId", kind) WHERE (kind = ANY (ARRAY['INSTANCE_STARTED'::text, 'INSTANCE_CLOSED'::text]))`,
+  "RLE.summary_range_uq":
+    `CREATE UNIQUE INDEX rle_summary_range_uq ON public."RateLimitEvidence" USING btree ("limiterInstanceId", "firstSequence", "lastSequence") WHERE (kind = 'SUMMARY'::text)`,
+  "RLE.gap_discontinuity_uq":
+    `CREATE UNIQUE INDEX rle_gap_discontinuity_uq ON public."RateLimitEvidence" USING btree ("limiterInstanceId", "missingFrom", "missingTo") WHERE ((kind = 'EVIDENCE_GAP'::text) AND ("gapReason" = 'SEQUENCE_DISCONTINUITY'::text))`,
+  "RLE.gap_unclean_uq":
+    `CREATE UNIQUE INDEX rle_gap_unclean_uq ON public."RateLimitEvidence" USING btree ("limiterInstanceId") WHERE ((kind = 'EVIDENCE_GAP'::text) AND ("gapReason" = 'UNCLEAN_TERMINATION'::text))`,
+});
 
 /** Rows per query; a query that failed (or did not run) is absent. */
 export type ReadinessObservations = ReadonlyMap<ReadinessQueryId, readonly Row[]>;
@@ -165,6 +206,34 @@ const TRANSACTION_QUERIES: readonly { readonly id: ReadinessQueryId; readonly sq
           FROM pg_catalog.pg_db_role_setting s
           WHERE s.setdatabase IN (0, (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()))
             AND s.setrole IN (0, (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user))`,
+  },
+  // Task 011A RD-7: appended after every Task 011 query, so they cannot remove an earlier observation.
+  {
+    id: "RLE.table",
+    schema: true,
+    sql: `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = $1 AND c.relname = 'RateLimitEvidence' AND c.relkind = 'r') AS table_exists`,
+  },
+  {
+    id: "RLE.pk",
+    schema: true,
+    sql: `SELECT array_agg(a.attname::text ORDER BY a.attname) AS pk_columns
+          FROM pg_catalog.pg_constraint con
+          JOIN pg_catalog.pg_class t ON t.oid = con.conrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+          JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (con.conkey)
+          WHERE con.contype = 'p' AND n.nspname = $1 AND t.relname = 'RateLimitEvidence'`,
+  },
+  {
+    id: "RLE.indexes",
+    schema: true,
+    sql: `SELECT ic.relname::text AS index_name, pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef,
+                 i.indisunique, i.indisvalid, i.indisready, i.indislive, i.indimmediate
+          FROM pg_catalog.pg_index i
+          JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
+          JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+          JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+          WHERE n.nspname = $1 AND t.relname = 'RateLimitEvidence'`,
   },
 ];
 
@@ -320,6 +389,25 @@ export function evaluateReadiness(
     (row) => Array.isArray(row.setconfig) && row.setconfig.some((entry) => typeof entry === "string" && NONZERO_TRANSACTION_TIMEOUT.test(entry)),
   );
   if (nonzero) return session("S6.c");
+
+  // Task 011A RD-7, evaluated last so that no earlier failure changes its reason.
+  const table = rows("RLE.table");
+  if (table === undefined || table[0]?.table_exists !== true) return structure("RLE.table");
+  const rlePk = rows("RLE.pk")?.[0]?.pk_columns;
+  if (!Array.isArray(rlePk) || rlePk.length !== 1 || rlePk[0] !== "id") return structure("RLE.pk");
+  const rleIndexes = rows("RLE.indexes");
+  for (const [assertion, definition] of Object.entries(RATE_LIMIT_EVIDENCE_INDEXES) as [RateLimitEvidenceIndexAssertion, string][]) {
+    const holds = rleIndexes?.some(
+      (index) =>
+        index.indexdef === definition &&
+        index.indisunique === true &&
+        index.indisvalid === true &&
+        index.indisready === true &&
+        index.indislive === true &&
+        index.indimmediate === true,
+    );
+    if (holds !== true) return structure(assertion);
+  }
 
   return { ready: true };
 }

@@ -23,6 +23,7 @@ describe("built @irs/db entry (VPF-1(c))", () => {
       "DEFAULT_POOL_SETTINGS",
       "DEFAULT_TRANSACTION_OPTIONS",
       "DISCONNECT_TIMEOUT_MS",
+      "EVIDENCE_MAX_WAIT_MS",
       "IngestionCommitUnknownError",
       "IngestionInvariantError",
       "LockedTransactionDeadlineError",
@@ -33,10 +34,17 @@ describe("built @irs/db entry (VPF-1(c))", () => {
       "classifyDatabaseError",
       "createDatabase",
       "disconnectWithin",
+      "findEvidenceRecoveryCandidates",
       "ingestEvent",
+      "readEvidenceDurableState",
+      "readEvidenceRegistration",
       "sha256Hex",
+      "validateEvidenceHistoricalGap",
       "verifySchemaReadiness",
       "withAdvisoryXactLock",
+      "writeEvidenceGroup",
+      "writeEvidenceUncleanGap",
+      "writeRejectionAuditRows",
     ]);
     assert.equal(entry.MAX_LOCKED_TRANSACTION_WINDOW_MS, 30_000);
     assert.equal(entry.DISCONNECT_TIMEOUT_MS, 5_000);

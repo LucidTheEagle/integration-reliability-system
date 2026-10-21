@@ -1,7 +1,7 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readdirSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { assertServerBaseline } from "./test-support/baseline.js";
 import { bootstrapScratch, dropScratch } from "./test-support/bootstrap.js";
@@ -11,6 +11,7 @@ import { sqlState } from "./test-support/pg.js";
 import type { PgClient } from "./test-support/pg.js";
 import { runPrismaCli } from "./test-support/prisma-cli.js";
 import { SHADOW_DATABASE, STATUS_FUNCTION } from "./test-support/registry.js";
+import { RATE_LIMIT_EVIDENCE_INDEXES, REQUIRED_MIGRATIONS } from "./schema-readiness.js";
 
 // MIG-T1 – MIG-T3 (Rev 1.7 §16.3) and M2 (Addendum VPF-6).
 
@@ -27,6 +28,19 @@ const MIGRATION_NAME = readdirSync(fileURLToPath(new URL("../../../prisma/migrat
 const GOLDEN_CHECKS = {
   Event_rawBodySha256_format_check: `CHECK (("rawBodySha256" ~ '^[0-9a-f]{64}$'::text))`,
   Event_rawBody_length_check: `CHECK (((octet_length("rawBody") >= 1) AND (octet_length("rawBody") <= 1048576)))`,
+};
+
+/**
+ * Task 011A (RD-5): golden PostgreSQL 17 text of the four RateLimitEvidence
+ * CHECKs, captured once (2026-10-21, r5-011a/db-stage2-capture.txt) and
+ * changed only by deliberate review. The four indexes' golden text is
+ * RATE_LIMIT_EVIDENCE_INDEXES, which readiness (RD-7) also pins.
+ */
+const GOLDEN_RLE_CHECKS = {
+  rle_gap_reason_ck: `CHECK (((kind <> 'EVIDENCE_GAP'::text) OR (("gapReason" IS NOT NULL) AND ("gapReason" = ANY (ARRAY['SEQUENCE_DISCONTINUITY'::text, 'UNCLEAN_TERMINATION'::text])))))`,
+  rle_gap_shape_ck: `CHECK (((kind <> 'EVIDENCE_GAP'::text) OR ("gapReason" IS DISTINCT FROM 'SEQUENCE_DISCONTINUITY'::text) OR (("missingFrom" IS NOT NULL) AND ("missingTo" IS NOT NULL) AND ("missingFrom" >= 1) AND ("missingTo" >= "missingFrom"))))`,
+  rle_kind_ck: `CHECK ((kind = ANY (ARRAY['INSTANCE_STARTED'::text, 'SUMMARY'::text, 'EVIDENCE_GAP'::text, 'INSTANCE_CLOSED'::text])))`,
+  rle_summary_shape_ck: `CHECK (((kind <> 'SUMMARY'::text) OR (("firstSequence" IS NOT NULL) AND ("lastSequence" IS NOT NULL) AND ("firstSequence" >= 1) AND ("lastSequence" >= "firstSequence"))))`,
 };
 
 // Admin mode: migrations, scratch databases and catalog snapshots.
@@ -71,7 +85,7 @@ async function mainSnapshot(client: PgClient): Promise<unknown> {
 }
 
 describe("MIG-T1: migrate deploy on an empty database", () => {
-  it("applies the init migration to an empty registered scratch database; the catalog matches", async () => {
+  it("applies every committed migration (init, then Task 011A's) to an empty registered scratch database; the catalog matches", async () => {
     assert.ok(MIGRATION_NAME !== undefined);
     const scratchUrl = await bootstrapScratch(admin, adminUrl, "migt1");
     try {
@@ -80,6 +94,7 @@ describe("MIG-T1: migrate deploy on an empty database", () => {
       });
       assert.equal(deploy.exitCode, 0, deploy.stderr);
       assert.match(deploy.stdout, new RegExp(`Applying migration \`${MIGRATION_NAME}\``));
+      for (const name of REQUIRED_MIGRATIONS) assert.match(deploy.stdout, new RegExp(`Applying migration \`${name}\``));
 
       // Admin mode: no test role is registered for this scratch database.
       const scratch = await connectGuarded({ url: scratchUrl, mode: "admin", applicationName: "irs-test-migt1" });
@@ -138,13 +153,17 @@ describe("MIG-T1: migrate deploy on an empty database", () => {
           `SELECT to_regclass('public."RateLimitEvidence"')::text AS rle,
                   to_regprocedure('public.${STATUS_FUNCTION}(uuid)')::text AS fn`,
         );
-        assert.equal(absent.rows[0]?.rle, null);
+        assert.equal(absent.rows[0]?.rle, `"RateLimitEvidence"`);
         assert.equal(absent.rows[0]?.fn, `${STATUS_FUNCTION}(uuid)`);
 
         const ledger = await c.query(
-          `SELECT migration_name, finished_at IS NOT NULL AS finished, rolled_back_at FROM "public"."_prisma_migrations"`,
+          `SELECT migration_name, finished_at IS NOT NULL AS finished, rolled_back_at FROM "public"."_prisma_migrations"
+            ORDER BY migration_name`,
         );
-        assert.deepEqual(ledger.rows, [{ migration_name: MIGRATION_NAME, finished: true, rolled_back_at: null }]);
+        assert.deepEqual(
+          ledger.rows,
+          REQUIRED_MIGRATIONS.map((name) => ({ migration_name: name, finished: true, rolled_back_at: null })),
+        );
       } finally {
         await scratch.close();
       }
@@ -215,6 +234,45 @@ describe("MIG-T3: drift check against the dedicated shadow database", () => {
   });
 });
 
+describe("MIG-T3 blindness for Task 011A's raw SQL (IRS-C-055; documentation)", () => {
+  // Documents, does not fix: the drift check compares the migration history with
+  // the Prisma schema, and Prisma does not model partial unique indexes (without
+  // a preview feature) or CHECKs. The 011A migration holds eight such raw objects
+  // that the schema does not declare, and the drift check still reports nothing.
+  // M1 (content), M2 (catalog golden text) and RD-7 (readiness) guard them instead.
+  it("the 011A migration holds the four rle_* indexes and four CHECKs, the schema names none, and the drift script mentions none", async () => {
+    const migrations = fileURLToPath(new URL("../../../prisma/migrations/", import.meta.url));
+    const name = REQUIRED_MIGRATIONS.find((entry) => entry.endsWith("_rate_limit_evidence")) ?? "";
+    const sql = readFileSync(`${migrations}${name}/migration.sql`, "utf8");
+    const schema = readFileSync(fileURLToPath(new URL("../../../prisma/schema.prisma", import.meta.url)), "utf8");
+    const objects = [...Object.values(RATE_LIMIT_EVIDENCE_INDEXES).map((def) => /INDEX (\S+) ON/.exec(def)?.[1] ?? "?"), ...Object.keys(GOLDEN_RLE_CHECKS)];
+    assert.equal(objects.length, 8);
+    for (const object of objects) {
+      assert.ok(sql.includes(object), `${object} in the migration`);
+      assert.ok(!schema.includes(object), `${object} not in the schema`);
+    }
+    const shadowUrl = withDatabase(adminUrl, SHADOW_DATABASE);
+    const script = await runPrismaCli(
+      [
+        "migrate",
+        "diff",
+        "--from-migrations",
+        "prisma/migrations",
+        "--to-schema",
+        "prisma/schema.prisma",
+        "--script",
+        "--config",
+        "packages/db/src/test-support/prisma.drift.config.ts",
+      ],
+      { IRS_DRIFT_DATASOURCE_URL: adminUrl, IRS_DRIFT_SHADOW_DATABASE_URL: shadowUrl },
+    );
+    process.stdout.write(`[IRS-C-055] --script: exit ${script.exitCode}; ${(script.stdout + script.stderr).trim()}\n`);
+    assert.equal(script.exitCode, 0, script.stderr);
+    assert.match(script.stdout, /empty migration/i);
+    for (const object of objects) assert.ok(!script.stdout.includes(object), `${object} not in the drift script`);
+  });
+});
+
 describe("M2: TD-3 CHECKs in the catalog", () => {
   it("pg_constraint holds both CHECKs, validated, with the golden PostgreSQL 17 text", async () => {
     const api = await connectGuarded({ url: apiUrl, mode: "api" });
@@ -262,6 +320,39 @@ describe("M2: TD-3 CHECKs in the catalog", () => {
       // foreign key (no Integration row), which proves the CHECK was not the cause.
       assert.equal((await insertError(Buffer.from("x"), validDigest)).state, "23503");
       assert.equal((await insertError(Buffer.alloc(1_048_576, 0x61), validDigest)).state, "23503");
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("Task 011A (RD-5): the four RateLimitEvidence natural-key indexes match their golden pg_get_indexdef() text", async () => {
+    const api = await connectGuarded({ url: apiUrl, mode: "api" });
+    try {
+      const result = await api.client.query<{ name: string; def: string; indisunique: boolean; indisvalid: boolean }>(
+        `SELECT x.relname AS name, pg_get_indexdef(i.indexrelid) AS def, i.indisunique, i.indisvalid
+           FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class x ON x.oid = i.indexrelid
+          WHERE i.indrelid = 'public."RateLimitEvidence"'::regclass AND x.relname LIKE 'rle\\_%' ORDER BY x.relname`,
+      );
+      const expected = Object.values(RATE_LIMIT_EVIDENCE_INDEXES)
+        .map((def) => ({ name: /INDEX (\S+) ON/.exec(def)?.[1] ?? "?", def, indisunique: true, indisvalid: true }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      assert.deepEqual(result.rows, expected);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("Task 011A (RD-5): the four RateLimitEvidence CHECKs exist, validated, with their golden pg_get_constraintdef() text", async () => {
+    const api = await connectGuarded({ url: apiUrl, mode: "api" });
+    try {
+      const result = await api.client.query<{ conname: string; def: string; convalidated: boolean }>(
+        `SELECT conname, pg_get_constraintdef(oid) AS def, convalidated FROM pg_catalog.pg_constraint
+          WHERE conrelid = 'public."RateLimitEvidence"'::regclass AND contype = 'c' ORDER BY conname`,
+      );
+      assert.deepEqual(
+        Object.fromEntries(result.rows.map((row) => [row.conname, { def: row.def, validated: row.convalidated }])),
+        Object.fromEntries(Object.entries(GOLDEN_RLE_CHECKS).map(([name, def]) => [name, { def, validated: true }])),
+      );
     } finally {
       await api.close();
     }

@@ -111,6 +111,11 @@ export const SCRATCH_PURPOSES: readonly ScratchPurpose[] = [
     description: "AL-T7e/AL-T9/AL-T11: a probe table for advisory-lock tests",
     sentinelRoles: [API_ROLE],
   },
+  {
+    purpose: "rle",
+    description: "Task 011A RD-7: readiness against an altered RateLimitEvidence table, primary key and natural-key indexes",
+    sentinelRoles: [API_ROLE],
+  },
 ];
 
 export function scratchDatabaseName(purpose: string): string {
@@ -154,8 +159,36 @@ const LEDGER_GRANTS: readonly GrantSpec[] = LEDGER_COLUMNS.map(
   (column): GrantSpec => ({ kind: "COLUMN", table: "_prisma_migrations", column, privilege: "SELECT" }),
 );
 
+const AUDIT_ENTRY_COLUMNS = ["id", "actorType", "actorId", "action", "entityType", "entityId", "metadata", "createdAt"] as const;
+const RATE_LIMIT_EVIDENCE_COLUMNS = [
+  "id",
+  "limiterInstanceId",
+  "scope",
+  "kind",
+  "gapReason",
+  "firstSequence",
+  "lastSequence",
+  "missingFrom",
+  "missingTo",
+  "payload",
+  "recordSha256",
+  "recordedAt",
+] as const;
+
+// Task 011A RD-6 (Addendum §2; P-3): the complete-row and complete-record
+// comparisons read every column. INSERT on AuditEntry is already part of
+// INGESTION_GRANTS. No UPDATE or DELETE. The API role only: the special roles
+// keep exactly their Task 011 sets.
+const EVIDENCE_GRANTS: readonly GrantSpec[] = [
+  ...AUDIT_ENTRY_COLUMNS.map((column): GrantSpec => ({ kind: "COLUMN", table: "AuditEntry", column, privilege: "SELECT" })),
+  { kind: "TABLE", table: "RateLimitEvidence", privilege: "INSERT" },
+  ...RATE_LIMIT_EVIDENCE_COLUMNS.map(
+    (column): GrantSpec => ({ kind: "COLUMN", table: "RateLimitEvidence", column, privilege: "SELECT" }),
+  ),
+];
+
 export const APPLICATION_GRANTS: Readonly<Record<string, readonly GrantSpec[]>> = {
-  [API_ROLE]: [...INGESTION_GRANTS, EXECUTE_GRANT, ...LEDGER_GRANTS],
+  [API_ROLE]: [...INGESTION_GRANTS, EXECUTE_GRANT, ...LEDGER_GRANTS, ...EVIDENCE_GRANTS],
   irs_test_api_no_ledger: [...INGESTION_GRANTS, EXECUTE_GRANT],
   irs_test_api_no_execute: [...INGESTION_GRANTS, ...LEDGER_GRANTS],
   irs_test_api_role_setting: [...INGESTION_GRANTS, EXECUTE_GRANT, ...LEDGER_GRANTS],

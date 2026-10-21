@@ -56,6 +56,13 @@ export async function grantProblems(client: PgClient): Promise<string[]> {
  * database (admin mode), mirroring the irs_011_test provisioning for the
  * given roles, plus any test-specific statements.
  */
+/**
+ * Task 011A (founder decision P-011A-2): the only table whose grants a
+ * scratch database may lack, because RD-T4 deploys a migration history that
+ * predates it. Any other missing table still fails the GRANT, as before.
+ */
+const SKIPPABLE_SCRATCH_TABLE = "RateLimitEvidence";
+
 export async function grantScratch(
   scratchUrl: string,
   roles: readonly string[],
@@ -63,10 +70,26 @@ export async function grantScratch(
 ): Promise<void> {
   const scratch = await connectGuarded({ url: scratchUrl, mode: "admin", applicationName: "irs-test-scratch-grants" });
   try {
+    const evidenceTable = await scratch.client.query<{ t: string | null }>(
+      `SELECT to_regclass('"public"."${SKIPPABLE_SCRATCH_TABLE}"')::text AS t`,
+    );
+    const evidenceTableAbsent = evidenceTable.rows[0]?.t == null;
     await scratch.client.query("BEGIN");
     await scratch.client.query(`ALTER FUNCTION ${STATUS_FUNCTION_SIGNATURE} OWNER TO "${LOCK_OWNER_ROLE}"`);
     for (const role of [LOCK_OWNER_ROLE, ...roles]) {
-      for (const grant of APPLICATION_GRANTS[role] ?? []) await scratch.client.query(grantStatement(grant, role));
+      for (const grant of APPLICATION_GRANTS[role] ?? []) {
+        if (
+          evidenceTableAbsent &&
+          (grant.kind === "TABLE" || grant.kind === "COLUMN") &&
+          grant.table === SKIPPABLE_SCRATCH_TABLE
+        ) {
+          process.stdout.write(
+            `[scratch-grants] skipped ${grantKey(grant)} for ${role}: "public"."${SKIPPABLE_SCRATCH_TABLE}" absent\n`,
+          );
+          continue;
+        }
+        await scratch.client.query(grantStatement(grant, role));
+      }
     }
     for (const statement of extraStatements) await scratch.client.query(statement);
     await scratch.client.query("COMMIT");

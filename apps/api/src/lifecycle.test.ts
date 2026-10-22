@@ -9,6 +9,14 @@ import type {
   RegistrationVerification,
   SignalSource,
 } from "./lifecycle.js";
+// Task 011A additions (Stage 7): the imports below serve only the added tests.
+import { randomUUID } from "node:crypto";
+import { createInMemoryEvidenceStore } from "./evidence-store.js";
+import type { InMemoryEvidenceStore } from "./evidence-store.js";
+import { composeEvidence } from "./production.js";
+import { DEFAULT_RATE_LIMIT_POLICIES } from "./rate-limit.js";
+import { DEFAULT_AUDIT_POLICIES } from "./rejection-audit.js";
+import { settleTurns } from "./test-helpers.js";
 
 // Function-level lifecycle tests (Rev 1.7 §16.3 LC-*). Process-level
 // termination is in lifecycle-process.test.ts.
@@ -456,5 +464,163 @@ describe("terminate (function level)", () => {
     await tick(250);
     assert.deepEqual(exits, [0]);
     assert.deepEqual(warnings, ["lingering handles after clean shutdown"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 011A additions (Stage 7): A-T18 and the A-T22 lifecycle cases, with
+// the real 011A composition over the in-memory store (state-machine tests).
+
+const SCOPE_011A = "lifecycle-011a";
+
+function composition(store: InMemoryEvidenceStore) {
+  return composeEvidence({
+    store,
+    rateLimitPolicies: DEFAULT_RATE_LIMIT_POLICIES,
+    auditPolicies: DEFAULT_AUDIT_POLICIES,
+    scope: SCOPE_011A,
+    random: () => 0.5,
+  });
+}
+
+function rejectionCandidate() {
+  return {
+    requestId: randomUUID(),
+    receivedAt: new Date().toISOString(),
+    stage: "VERIFIER" as const,
+    httpStatus: 401 as const,
+    errorCode: "UNAUTHORIZED" as const,
+    claimedIntegrationId: null,
+    verifierReason: "SIGNATURE_MISMATCH",
+    responseCompletion: "FINISH_OBSERVED" as const,
+  };
+}
+
+/** Lifecycle steps wired to a composition's slots, recording the order of events. */
+function composedSteps(ev: ReturnType<typeof composition>, events: string[], overrides: Partial<LifecycleSteps> = {}, budgets: Partial<LifecycleBudgets> = {}) {
+  return steps(
+    {
+      startupSlot: async (signal) => {
+        await ev.slots.startupSlot(signal);
+        events.push("startupSlot:resolved");
+      },
+      verifyRegistration: (deadline) => ev.slots.verifyRegistration(deadline),
+      listen: async () => {
+        events.push(`listen(recorder:${ev.recorder.state},consumer:${ev.consumer.state})`);
+      },
+      intakeBarrier: async (reason) => {
+        events.push(`intake:${reason}`);
+        return { forced: false };
+      },
+      finalizeBeforeDisconnect: async (reason, intake) => {
+        events.push(`finalize:${reason}`);
+        const result = await ev.slots.finalizeBeforeDisconnect(reason, intake);
+        events.push(`finalized:${String(result.successAllowed)}:recorder:${ev.recorder.state}`);
+        return result;
+      },
+      disconnect: async () => {
+        events.push("disconnect");
+        return { completed: true };
+      },
+      ...overrides,
+    },
+    { finalizationMs: 5_000, startupSlotMs: 5_000, ...budgets },
+  );
+}
+
+describe("Task 011A A-T18: lifecycle order with the real composition", () => {
+  it("after INSTANCE_STARTED is confirmed: recorder.start, consumer.start, then listen; the first rejection is persisted without waiting for pairing; SIGNAL → F-A → exit 0", async () => {
+    const store = createInMemoryEvidenceStore();
+    const ev = composition(store);
+    const events: string[] = [];
+    const { steps: lifecycle } = composedSteps(ev, events);
+    const signals = new FakeSignals();
+    const running = runApi(lifecycle, signals);
+    // The overridden steps record to `events` (not to `calls`).
+    while (!events.some((event) => event.startsWith("listen"))) await tick(5);
+    assert.deepEqual(events.slice(0, 2), ["startupSlot:resolved", "listen(recorder:RUNNING,consumer:RUNNING)"]);
+    const registered = store.raw.evidenceRows(ev.limiterInstanceId).map((row) => row.kind);
+    assert.deepEqual(registered, ["INSTANCE_STARTED"], "registered before listen");
+    ev.sink.submit(rejectionCandidate());
+    await settleTurns();
+    assert.equal(store.raw.rejectionRows().length, 1, "persisted without waiting for a pairing interval");
+    signals.emit();
+    const result = await running;
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(events.slice(2), ["intake:SIGNAL", "finalize:SIGNAL", "finalized:true:recorder:FINALIZED", "disconnect"]);
+    assert.deepEqual(
+      store.raw.evidenceRows(ev.limiterInstanceId).map((row) => row.kind).sort(),
+      ["INSTANCE_CLOSED", "INSTANCE_STARTED", "SUMMARY"],
+    );
+  });
+
+  it("listen fails → finalizeEvidence(LISTEN_FAILED) in the §8.3 order: barrier (forced false), recorder.finalize, final pair and write, INSTANCE_CLOSED, disconnect; exit 1", async () => {
+    const store = createInMemoryEvidenceStore();
+    const ev = composition(store);
+    const events: string[] = [];
+    const { steps: lifecycle } = composedSteps(ev, events, {
+      listen: async () => {
+        events.push("listen");
+        throw new Error("EADDRINUSE");
+      },
+    });
+    const callsBefore = store.calls.length;
+    const result = await runApi(lifecycle, new FakeSignals());
+    assert.equal(result.exitCode, 1);
+    assert.deepEqual(events, [
+      "startupSlot:resolved",
+      "listen",
+      "intake:LISTEN_FAILED",
+      "finalize:LISTEN_FAILED",
+      "finalized:true:recorder:FINALIZED",
+      "disconnect",
+    ]);
+    const kinds = store.calls.slice(callsBefore).filter((call) => call.method === "writeEvidenceGroup").map((call) => call.kinds.join("+"));
+    assert.deepEqual(kinds, ["INSTANCE_STARTED", "SUMMARY", "INSTANCE_CLOSED"], "registration, the one final summary, then the close");
+  });
+});
+
+describe("Task 011A A-T22: a startup slot unsettled at the post-signal wait", () => {
+  it("no finalization, exit 1; when its registration then commits, the next startup records UNCLEAN_TERMINATION", async () => {
+    const store = createInMemoryEvidenceStore();
+    const gate = store.faults.delayCommit({ methods: ["writeEvidenceGroup"] });
+    const ev = composition(store);
+    const events: string[] = [];
+    const { steps: lifecycle } = composedSteps(ev, events, {}, { slotSignalWaitMs: 100, startupSlotMs: 5_000 });
+    const signals = new FakeSignals();
+    const running = runApi(lifecycle, signals);
+    await gate.reached;
+    signals.emit();
+    const result = await running;
+    assert.equal(result.exitCode, 1);
+    assert.ok(!events.some((event) => event.startsWith("finalize")), "no finalization");
+    assert.deepEqual(events, ["disconnect"]);
+    gate.release();
+    await settleTurns();
+    assert.deepEqual(store.raw.evidenceRows(ev.limiterInstanceId).map((row) => row.kind), ["INSTANCE_STARTED"], "the registration committed later");
+    const next = composition(store);
+    await next.slots.startupSlot(new AbortController().signal);
+    const gap = store.raw.evidenceRows(ev.limiterInstanceId).find((row) => row.kind === "EVIDENCE_GAP");
+    assert.equal(gap?.gapReason, "UNCLEAN_TERMINATION");
+    next.consumer.stopTimer();
+  });
+
+  it("when the registration never commits, nothing is recorded for the instance", async () => {
+    const store = createInMemoryEvidenceStore();
+    const hang = store.faults.hang({ methods: ["writeEvidenceGroup"] });
+    const ev = composition(store);
+    const events: string[] = [];
+    const { steps: lifecycle } = composedSteps(ev, events, {}, { slotSignalWaitMs: 100, startupSlotMs: 5_000 });
+    const signals = new FakeSignals();
+    const running = runApi(lifecycle, signals);
+    await hang.reached;
+    signals.emit();
+    const result = await running;
+    assert.equal(result.exitCode, 1);
+    assert.deepEqual(events, ["disconnect"], "no finalization");
+    const next = composition(store);
+    await next.slots.startupSlot(new AbortController().signal);
+    assert.deepEqual(store.raw.evidenceRows(ev.limiterInstanceId), [], "nothing recorded");
+    next.consumer.stopTimer();
   });
 });

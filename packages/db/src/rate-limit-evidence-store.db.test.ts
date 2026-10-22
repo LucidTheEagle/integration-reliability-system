@@ -5,6 +5,7 @@ import type { Database, TransactionClient } from "./client.js";
 import { disconnectWithin } from "./client.js";
 import { classifyDatabaseError } from "./errors.js";
 import {
+  canonicalJson,
   evidenceRecordHash,
   findEvidenceRecoveryCandidates,
   readEvidenceDurableState,
@@ -289,6 +290,42 @@ describe("A-T20 (PostgreSQL half): direct SQL inserts of malformed rows (api mod
     } finally {
       await api.close();
     }
+  });
+});
+
+describe("PA-4: exponent-form numbers through jsonb, on the real write and re-read path", () => {
+  it("a payload with exponent-form numbers is IDENTICAL_EXISTS on an identical retry (no duplicate); a different value is CONFLICT", async () => {
+    const scope = newScope();
+    const instance = randomUUID();
+    // Canonical JSON renders these in exponent form; jsonb (numeric) stores and returns them in positional form.
+    const numbers = { tiny: 1e-7, smaller: 1.5e-10, negative: -3.2e-8, extreme: 1e-300, fractionalLarge: 123456789012345.67 };
+    assert.equal(canonicalJson(numbers.tiny), "1e-7");
+    // A value >= 1e21 cannot appear in a payload: every double >= 2^53 is an integer, and canonical JSON refuses unsafe integers.
+    assert.throws(() => canonicalJson({ big: 1e21 }), TypeError);
+    const record = sealRow({
+      ...base(scope, instance),
+      kind: "INSTANCE_STARTED",
+      recordedAt: T0,
+      payload: { schemaVersion: 1, limiterInstanceId: instance, instanceStartedAt: T0, scope, rateLimitPolicies: {}, auditPolicies: numbers },
+    });
+    assert.deepEqual(await writeEvidenceGroup(db, [record]), ["CREATED"]);
+    // Admin mode, observation: the stored jsonb really is in positional form.
+    const stored = (
+      await admin.client.query<{ tiny: string }>(
+        `SELECT "payload"->'auditPolicies'->>'tiny' AS "tiny" FROM "public"."RateLimitEvidence" WHERE "id" = $1::uuid`,
+        [record.id],
+      )
+    ).rows[0];
+    assert.equal(stored?.tiny, "0.0000001");
+    assert.deepEqual(await writeEvidenceGroup(db, [record]), ["IDENTICAL_EXISTS"]);
+    assert.deepEqual(await storedRows(instance), [record]);
+    const different = sealRow({
+      ...record,
+      id: randomUUID(),
+      payload: { ...(record.payload as Record<string, EvidenceJson>), auditPolicies: { ...numbers, tiny: 2e-7 } },
+    });
+    assert.deepEqual(await writeEvidenceGroup(db, [different]), ["CONFLICT"]);
+    assert.deepEqual(await storedRows(instance), [record]);
   });
 });
 

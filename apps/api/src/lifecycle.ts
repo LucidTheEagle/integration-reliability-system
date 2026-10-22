@@ -53,8 +53,10 @@ export interface LifecycleBudgets {
 
 export const DEFAULT_LIFECYCLE_BUDGETS: LifecycleBudgets = Object.freeze({
   intakeBarrierMs: 11_000,
-  finalizationMs: 1_000,
-  startupSlotMs: 1_000,
+  // Task 011A (RD-11, B-10): D2 5 s + D3 5 s + 1 s margin.
+  finalizationMs: 11_000,
+  // Task 011A (RD-11, B-10): the AD-7 startup retry budget of 30 s + 1 s margin.
+  startupSlotMs: 31_000,
   readinessMs: 38_000,
   slotSignalWaitMs: 5_000,
   registrationVerificationMs: 1_000,

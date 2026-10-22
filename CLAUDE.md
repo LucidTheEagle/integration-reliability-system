@@ -68,6 +68,22 @@ Do not report `pnpm lint` as a successful lint check: no package defined a `lint
 
 **Database tests (Task 011).** `pnpm test` is database-free: test scripts exclude `*.db.test.js`. Database tests run only through `pnpm --filter @irs/db test:db` and `pnpm --filter @irs/api test:db`. Both use the same test database, so **run them one after the other, never at the same time**; neither script runs the other. `apps/api`'s database tests load `@irs/db`'s test support from `packages/db/dist/test-support/` (its `test:db` builds `@irs/db` first). Each script needs `IRS_TEST_DATABASE_URL` and `IRS_TEST_ADMIN_DATABASE_URL`, fails loudly if either is missing, and refuses any target its guard (`packages/db/src/test-support/guard.ts`) does not accept: only `127.0.0.1:55433` and the registered `irs_011_*_test` databases carrying the sentinel. Never point these variables at `irs_dev` or any shared database. Prisma CLI processes started by the test support (`packages/db/src/test-support/prisma-cli.ts`) run with `CHECKPOINT_DISABLE=1`, so test runs make no Prisma update or telemetry check.
 
+**Authoring a later migration (Task 011A).** Never use `migrate dev`, `db push` or `migrate reset`. From `packages/db`, after `pnpm run build`, with both `IRS_TEST_*` variables set, run `node dist/test-support/setup.js author-next prisma/migrations/<YYYYMMDDHHMMSS>_<name>/migration.sql` (UTC timestamp).
+- It refuses `_init`, a timestamp that is not later than every existing migration, and an existing target directory.
+- It runs `prisma migrate diff --from-migrations prisma/migrations --to-schema prisma/schema.prisma --script` through the guarded Prisma runner, with the drift config (`packages/db/src/test-support/prisma.drift.config.ts`) and the registered shadow database. Both sentinels are re-verified after the child exits.
+- It writes the file only when the diff is non-empty.
+
+SQL that Prisma cannot express (partial unique indexes, CHECKs, comments) is then appended to that file by hand. Keep LF line endings (`.gitattributes` pins them), append the name to `REQUIRED_MIGRATIONS` (`packages/db/src/schema-readiness.ts`), and apply it once with `node dist/test-support/setup.js provision`. That runs `migrate deploy`, then the registry grants, then the exact grant-set check.
+
+MIG-T3's drift check cannot see hand-written SQL objects. The M2 tests in `migration.db.test.ts` and the readiness checks pin those objects instead.
+
+**Database tests (Task 011A).**
+- `@irs/api` `test:db` now also runs `audit-composed.db.test.js` and the synthetic load run `perf-011a.db.test.js` (about 6–7 minutes on its own), so a full run takes noticeably longer.
+- Commit stalls ("RD-8") use `stallCommits` / `revertCommitStall` (`packages/db/src/test-support/syncrep-stall.ts`): a role-level `synchronous_commit = on` plus a non-existent `synchronous_standby_names`, so a COMMIT waits on SyncRep until its backend is terminated. Every revert is verified.
+- The scratch database purpose `rle` (registry) is used for the readiness tests against an altered `RateLimitEvidence` table.
+
+**On a host with limited memory**, run database tests one file at a time, using the package's own `test:db` steps with an explicit `dist/<file>.db.test.js`. Before and after each file, check that no node process remains and that enough memory is available.
+
 Use the Node and pnpm versions declared by the repository. Do not install, upgrade, or globally reconfigure tools without approval.
 
 ## 7. Task completion report

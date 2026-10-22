@@ -562,6 +562,153 @@ describe("PostgreSQL adapter: RD-3 connection cap (database-free)", () => {
   });
 });
 
+describe("PostgreSQL adapter: PA-3 cutoff (database-free; latches and a manual clock, no timing)", () => {
+  /** A fake Database whose transactions the test settles, on a manual monotonic clock. */
+  function clockedDatabase(): { db: Database; transactions: FakeTransaction[]; clock: { now: number } } {
+    const clock = { now: 1_000 };
+    const { db, transactions } = controlledDatabase();
+    return { db: { ...db, monotonicNow: () => clock.now }, transactions, clock };
+  }
+
+  /** Manual timers: the test fires them. */
+  function manualTimers() {
+    const pending = new Map<number, { callback: () => void; delayMs: number }>();
+    let next = 0;
+    return {
+      timers: {
+        set(callback: () => void, delayMs: number) {
+          next += 1;
+          pending.set(next, { callback, delayMs });
+          return next;
+        },
+        clear(handle: unknown) {
+          pending.delete(handle as number);
+        },
+      },
+      pending,
+      fired: [] as (() => void)[],
+      fireAll() {
+        for (const [handle, entry] of [...pending]) {
+          pending.delete(handle);
+          this.fired.push(entry.callback);
+          entry.callback();
+        }
+      },
+    };
+  }
+
+  async function cutoffError(promise: Promise<unknown>): Promise<{ phase?: unknown; outcome?: unknown; name?: unknown }> {
+    return promise.then(
+      () => assert.fail("expected the cutoff to refuse the operation"),
+      (error: unknown) => error as { phase?: unknown; outcome?: unknown; name?: unknown },
+    );
+  }
+
+  it("cap occupied, a write queued, the cutoff passed, then a slot released: the queued primitive is never called; later calls are refused", async () => {
+    const { db, transactions, clock } = clockedDatabase();
+    const manual = manualTimers();
+    const store = createPostgresEvidenceStore({ db, timers: manual.timers });
+    const first = store.writeRejections([]);
+    const second = store.writeRejections([]);
+    const queued = store.writeRejections([]);
+    await turns();
+    assert.equal(transactions.length, 2);
+    assert.deepEqual([store.inFlight, store.waiting, store.highWaterMark], [2, 1, 2]);
+    store.cutoffAt(clock.now + 100);
+    assert.equal(manual.pending.size, 1, "a timer is armed at the deadline");
+    clock.now += 100; // the deadline has passed; the timer has not fired
+    transactions[0]?.settle(true);
+    const refused = await cutoffError(queued);
+    assert.deepEqual([refused.name, refused.phase, refused.outcome], ["EvidenceCutoffError", "NOT_STARTED", "NOT_COMMITTED"]);
+    assert.equal(storeErrorOutcome(refused), "NOT_COMMITTED");
+    await first;
+    await turns();
+    assert.equal(transactions.length, 2, "the queued primitive was never called");
+    assert.deepEqual([store.inFlight, store.waiting, store.highWaterMark], [1, 0, 2]);
+    assert.equal(manual.pending.size, 0, "the timer is cleared once the cutoff has expired");
+    // Later calls are refused at dispatch, even with a free slot (sticky).
+    await cutoffError(store.findRecoveryCandidates(SCOPE, randomUUID()));
+    await cutoffError(store.verifyRegistration(randomUUID(), clock.now + 1_000));
+    assert.equal(transactions.length, 2);
+    assert.equal(store.refusedByCutoff, 3, "the queued write and the two later calls");
+    // The in-flight operation keeps its slot until it settles (B-2).
+    assert.equal(store.inFlight, 1);
+    transactions[1]?.settle(false);
+    await second.catch(() => undefined);
+    assert.deepEqual([store.inFlight, store.waiting, store.highWaterMark], [0, 0, 2]);
+  });
+
+  it("the timer at the deadline refuses everything still queued; in-flight operations are unaffected", async () => {
+    const { db, transactions, clock } = clockedDatabase();
+    const manual = manualTimers();
+    const store = createPostgresEvidenceStore({ db, timers: manual.timers, limit: 1 });
+    const running = store.writeRejections([]);
+    const queuedA = store.writeRejections([]);
+    const queuedB = store.findRecoveryCandidates(SCOPE, randomUUID());
+    await turns();
+    assert.deepEqual([store.inFlight, store.waiting], [1, 2]);
+    store.cutoffAt(clock.now + 5_000);
+    assert.deepEqual([...manual.pending.values()].map((entry) => entry.delayMs), [5_000]);
+    manual.fireAll();
+    await cutoffError(queuedA);
+    await cutoffError(queuedB);
+    assert.deepEqual([store.inFlight, store.waiting, transactions.length, store.refusedByCutoff], [1, 0, 1, 2]);
+    transactions[0]?.settle(true);
+    await running;
+    assert.deepEqual([store.inFlight, store.waiting, store.highWaterMark, transactions.length], [0, 0, 1, 1]);
+  });
+
+  it("before the deadline nothing changes; the earliest deadline applies; a deadline already passed expires at once", async () => {
+    const { db, transactions, clock } = clockedDatabase();
+    const manual = manualTimers();
+    const store = createPostgresEvidenceStore({ db, timers: manual.timers });
+    store.cutoffAt(clock.now + 5_000);
+    store.cutoffAt(clock.now + 9_000); // a later deadline never extends the cutoff
+    assert.deepEqual([...manual.pending.values()].map((entry) => entry.delayMs), [5_000]);
+    const allowed = store.writeRejections([]);
+    await turns();
+    assert.equal(transactions.length, 1, "before the deadline an operation starts normally");
+    transactions[0]?.settle(true);
+    await allowed;
+    store.cutoffAt(clock.now); // the slot's second call when finalization resolves: min(D3, now)
+    assert.equal(manual.pending.size, 0);
+    await cutoffError(store.writeRejections([]));
+    assert.deepEqual([transactions.length, store.refusedByCutoff], [1, 1]);
+    assert.throws(() => store.cutoffAt(Number.NaN), RangeError);
+  });
+
+  it("the timer settles each queued operation exactly once: a repeated timer callback and a later slot release settle nothing again", async () => {
+    const { db, transactions, clock } = clockedDatabase();
+    const manual = manualTimers();
+    const store = createPostgresEvidenceStore({ db, timers: manual.timers, limit: 1 });
+    const running = store.writeRejections([]);
+    const settlements = [0, 0];
+    const queued = [store.writeRejections([]), store.findRecoveryCandidates(SCOPE, randomUUID())].map((promise, index) =>
+      promise.then(
+        () => assert.fail("a queued operation started"),
+        (error: unknown) => {
+          settlements[index] = (settlements[index] ?? 0) + 1;
+          return error;
+        },
+      ),
+    );
+    await turns();
+    store.cutoffAt(clock.now + 5_000);
+    manual.fireAll();
+    await Promise.all(queued);
+    assert.deepEqual(settlements, [1, 1]);
+    assert.deepEqual([store.waiting, store.refusedByCutoff], [0, 2]);
+    // A repeated timer callback, then the running operation settling (a slot freed after the deadline): nothing settles again.
+    manual.fired[0]?.();
+    clock.now += 5_000;
+    transactions[0]?.settle(true);
+    await running;
+    await turns();
+    assert.deepEqual(settlements, [1, 1]);
+    assert.deepEqual([store.inFlight, store.waiting, store.refusedByCutoff, transactions.length], [0, 0, 2, 1]);
+  });
+});
+
 describe("B-1: storeErrorOutcome decides by outcome only", () => {
   it("only an explicit NOT_COMMITTED is NOT_COMMITTED; everything else is UNKNOWN", () => {
     assert.equal(storeErrorOutcome({ outcome: "NOT_COMMITTED" }), "NOT_COMMITTED");

@@ -18,6 +18,7 @@ import type {
   RateLimitPolicies,
   RateLimiter,
 } from "./rate-limit.js";
+import type { RejectionAuditSink, RejectionCandidate } from "./rejection-audit.js";
 import { createSecretResolver } from "./secrets.js";
 import { buildServer } from "./server.js";
 import type { ServerOptions } from "./server.js";
@@ -86,6 +87,49 @@ export class ManualClock {
   }
 }
 
+/** Lets promise chains and I/O callbacks settle (a few macrotask turns). */
+export async function settleTurns(count = 10): Promise<void> {
+  for (let turn = 0; turn < count; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * Task 011A timers on a ManualClock: advance() moves the clock to each due
+ * task in order, runs it, and lets promise chains settle in between.
+ */
+export class ManualScheduler {
+  private next = 0;
+  private readonly tasks = new Map<number, { readonly due: number; readonly callback: () => void }>();
+  constructor(readonly clock: ManualClock) {}
+  readonly setTimeout = (callback: () => void, delayMs: number): unknown => {
+    this.next += 1;
+    this.tasks.set(this.next, { due: this.clock.now() + Math.max(0, delayMs), callback });
+    return this.next;
+  };
+  readonly clearTimeout = (handle: unknown): void => {
+    this.tasks.delete(handle as number);
+  };
+  get pending(): number {
+    return this.tasks.size;
+  }
+  async advance(ms: number): Promise<void> {
+    const target = this.clock.now() + ms;
+    for (;;) {
+      await settleTurns();
+      let earliest: [number, { readonly due: number; readonly callback: () => void }] | undefined;
+      for (const entry of this.tasks) {
+        if (entry[1].due > target) continue;
+        if (earliest === undefined || entry[1].due < earliest[1].due) earliest = entry;
+      }
+      if (earliest === undefined) break;
+      this.tasks.delete(earliest[0]);
+      if (earliest[1].due > this.clock.now()) this.clock.advance(earliest[1].due - this.clock.now());
+      earliest[1].callback();
+    }
+    if (target > this.clock.now()) this.clock.advance(target - this.clock.now());
+    await settleTurns();
+  }
+}
+
 export class LogCapture {
   readonly lines: string[] = [];
   /** A write containing `throwOn` throws instead of being recorded. */
@@ -105,6 +149,27 @@ export class LogCapture {
       .split("\n")
       .filter((line) => line.trim() !== "")
       .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+  /** Task 011A: the number of records whose message is `message`. */
+  count(message: string): number {
+    return this.records().filter((record) => record.msg === message).length;
+  }
+}
+
+/** Task 011A: a sink that records every candidate; optionally throws after recording. */
+export class RecordingSink implements RejectionAuditSink {
+  readonly candidates: RejectionCandidate[] = [];
+  constructor(private readonly throws = false) {}
+  submit(candidate: RejectionCandidate): void {
+    this.candidates.push(candidate);
+    if (this.throws) throw new Error("sink failed");
+  }
+}
+
+/** Task 011A unmapped-log accounting: only the designated RD-15 test may log REJECTION_STAGE_UNMAPPED. */
+export function assertNoUnmappedLog(logs: LogCapture): void {
+  if (logs.count("REJECTION_STAGE_UNMAPPED") !== 0) {
+    throw new Error("REJECTION_STAGE_UNMAPPED was logged outside the designated RD-15 test");
   }
 }
 
@@ -191,6 +256,10 @@ export function makeApp(
     logs?: LogCapture;
     /** Replaces the real verifier; inputs are still recorded. */
     verifyWebhook?: typeof verifyIrsV1Webhook;
+    /** Task 011A: an explicit request-path limiter (for example a composed one); exclusive with `rateLimit`. */
+    rateLimiter?: RateLimiter;
+    /** Task 011A: the rejection-audit sink given to buildServer. */
+    rejectionAudit?: RejectionAuditSink;
   } = {},
 ): TestApp {
   const handoff = options.handoff ?? new RecordingHandoff();
@@ -239,6 +308,8 @@ export function makeApp(
             rateLimiter:
               options.rateLimit?.wrap?.(rateLimit.limiter) ?? rateLimit.limiter,
           }),
+      ...(options.rateLimiter === undefined ? {} : { rateLimiter: options.rateLimiter }),
+      ...(options.rejectionAudit === undefined ? {} : { rejectionAudit: options.rejectionAudit }),
     },
     { logger: { level: "info", stream: logs }, ...options.server },
   );

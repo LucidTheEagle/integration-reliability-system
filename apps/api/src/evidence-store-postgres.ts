@@ -9,6 +9,17 @@
  * when the primitive's promise settles. A caller that stops waiting (the
  * D3 race, an UNKNOWN outcome) releases nothing: a detached or stalled
  * write keeps its slot until it truly settles. Waiters are served in order.
+ *
+ * PA-3 (resolves P-011A-13): an adapter-only, sticky cutoff. Once the D3
+ * cutoff is reached, no queued or newly submitted operation may start: the
+ * adapter checks the absolute monotonic deadline (db.monotonicNow)
+ * immediately before every dispatch, and the cutoff stays in force once
+ * triggered. Such an operation is rejected { phase: "NOT_STARTED",
+ * outcome: "NOT_COMMITTED" } and its primitive is never called. The
+ * queue-expiration timer settles waiting operations as definitely not
+ * started, exactly once. Operations already running are unaffected: they
+ * keep their RD-3 slots until their promises settle and may commit after
+ * D3 (B-2), so their outcomes stay genuinely uncertain.
  */
 import {
   findEvidenceRecoveryCandidates,
@@ -41,38 +52,121 @@ export interface EvidenceConnectionCap {
   readonly highWaterMark: number;
   /** Operations waiting for a slot. */
   readonly waiting: number;
+  /** PA-3: operations the cutoff refused before their primitive was called (each counted once). */
+  readonly refusedByCutoff: number;
 }
 
-export interface PostgresEvidenceStore extends EvidenceStore, EvidenceConnectionCap {}
+/** PA-3: the adapter-only cutoff. Not part of the EvidenceStore port. */
+export interface EvidenceStoreCutoff {
+  /**
+   * From `deadline` (absolute, on db.monotonicNow) no operation starts.
+   * Sticky: the earliest deadline given applies, and it never lifts.
+   */
+  cutoffAt(deadline: number): void;
+}
 
-interface Limiter extends EvidenceConnectionCap {
+export interface PostgresEvidenceStore extends EvidenceStore, EvidenceConnectionCap, EvidenceStoreCutoff {}
+
+/** Thrown for an operation the cutoff stopped before its primitive was called. */
+export class EvidenceCutoffError extends Error {
+  override readonly name = "EvidenceCutoffError";
+  readonly phase = "NOT_STARTED" as const;
+  readonly outcome = "NOT_COMMITTED" as const;
+  constructor() {
+    super("evidence store cutoff: the operation was not started");
+  }
+}
+
+/** The cutoff's timer; injectable for tests. Default setTimeout, unref'd. */
+export interface CutoffTimers {
+  set(callback: () => void, delayMs: number): unknown;
+  clear(handle: unknown): void;
+}
+
+const DEFAULT_TIMERS: CutoffTimers = {
+  set(callback, delayMs) {
+    const handle = setTimeout(callback, delayMs);
+    handle.unref();
+    return handle;
+  },
+  clear(handle) {
+    clearTimeout(handle as NodeJS.Timeout);
+  },
+};
+
+interface Limiter extends EvidenceConnectionCap, EvidenceStoreCutoff {
   run<T>(operation: () => Promise<T>): Promise<T>;
 }
 
-function createLimiter(limit: number): Limiter {
+interface Waiter {
+  readonly start: () => void;
+  readonly refuse: (error: EvidenceCutoffError) => void;
+}
+
+function createLimiter(limit: number, now: () => number, timers: CutoffTimers): Limiter {
   if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("the evidence connection limit must be an integer >= 1");
   let inFlight = 0;
   let highWaterMark = 0;
-  const queue: (() => void)[] = [];
+  const queue: Waiter[] = [];
+  let cutoff: number | undefined;
+  let expired = false;
+  let timer: unknown;
+  let refusedByCutoff = 0;
+
+  function refused(): EvidenceCutoffError {
+    refusedByCutoff += 1;
+    return new EvidenceCutoffError();
+  }
+
+  function pastCutoff(): boolean {
+    if (!expired && cutoff !== undefined && now() >= cutoff) expire();
+    return expired;
+  }
+
+  /** Rejects every queued operation; from now on nothing starts. */
+  function expire(): void {
+    expired = true;
+    if (timer !== undefined) {
+      timers.clear(timer);
+      timer = undefined;
+    }
+    for (const waiter of queue.splice(0)) waiter.refuse(refused());
+  }
 
   function acquire(): Promise<void> {
+    if (pastCutoff()) return Promise.reject(refused());
     if (inFlight < limit) {
       inFlight += 1;
       highWaterMark = Math.max(highWaterMark, inFlight);
       return Promise.resolve();
     }
-    return new Promise((resolve) => queue.push(resolve));
+    return new Promise((start, refuse) => queue.push({ start, refuse }));
   }
 
   // A released slot passes straight to the next waiter (inFlight unchanged),
-  // so no new caller can take it in between.
+  // so no new caller can take it in between. Past the cutoff, the waiters
+  // are refused and the slot is freed.
   function release(): void {
-    const next = queue.shift();
-    if (next === undefined) inFlight -= 1;
-    else next();
+    if (!pastCutoff()) {
+      const next = queue.shift();
+      if (next !== undefined) {
+        next.start();
+        return;
+      }
+    }
+    inFlight -= 1;
   }
 
   return {
+    cutoffAt(deadline: number): void {
+      if (typeof deadline !== "number" || Number.isNaN(deadline)) throw new RangeError("cutoffAt: deadline must be a number");
+      if (expired) return;
+      if (cutoff !== undefined && cutoff <= deadline) return;
+      cutoff = deadline;
+      if (pastCutoff()) return;
+      if (timer !== undefined) timers.clear(timer);
+      timer = timers.set(expire, Math.max(0, deadline - now()));
+    },
     async run<T>(operation: () => Promise<T>): Promise<T> {
       await acquire();
       let pending: Promise<T>;
@@ -93,6 +187,9 @@ function createLimiter(limit: number): Limiter {
     },
     get waiting() {
       return queue.length;
+    },
+    get refusedByCutoff() {
+      return refusedByCutoff;
     },
   };
 }
@@ -156,10 +253,17 @@ export function createPostgresEvidenceStore(options: {
   readonly db: Database;
   readonly hooks?: EvidenceStoreHooks;
   readonly limit?: number;
+  /** @internal — test seam for the cutoff timer. */
+  readonly timers?: CutoffTimers;
 }): PostgresEvidenceStore {
   const { db, hooks = {} } = options;
-  const limiter = createLimiter(options.limit ?? DEFAULT_EVIDENCE_CONNECTION_LIMIT);
+  const limiter = createLimiter(
+    options.limit ?? DEFAULT_EVIDENCE_CONNECTION_LIMIT,
+    () => db.monotonicNow(),
+    options.timers ?? DEFAULT_TIMERS,
+  );
   return {
+    cutoffAt: (deadline) => limiter.cutoffAt(deadline),
     findRecoveryCandidates: (scope, excludeInstanceId) =>
       limiter.run(() => findEvidenceRecoveryCandidates(db, scope, excludeInstanceId, hooks)),
     readDurableState: (limiterInstanceId) =>
@@ -180,6 +284,9 @@ export function createPostgresEvidenceStore(options: {
     },
     get waiting() {
       return limiter.waiting;
+    },
+    get refusedByCutoff() {
+      return limiter.refusedByCutoff;
     },
   };
 }

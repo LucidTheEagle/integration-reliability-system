@@ -26,6 +26,13 @@ import type {
   RateLimiter,
 } from "./rate-limit.js";
 import type { SecretResolver } from "./secrets.js";
+import type {
+  EligibleErrorCode,
+  RejectionAuditSink,
+  RejectionCandidate,
+  RejectionContext,
+  ResponseCompletion,
+} from "./rejection-audit.js";
 
 /** The server binds to loopback only. */
 export const LISTEN_HOST = "127.0.0.1";
@@ -50,6 +57,11 @@ export interface ServerDependencies {
    * are still enforced, but summaries cannot be drained.
    */
   readonly rateLimiter?: RateLimiter;
+  /**
+   * Task 011A: the request-path rejection-audit capability. Absent → no
+   * individual audit, and Task 011B's behaviour is unchanged.
+   */
+  readonly rejectionAudit?: RejectionAuditSink;
 }
 
 export interface ServerOptions {
@@ -111,18 +123,101 @@ export interface ResponseGate {
     reply: FastifyReply,
     code: ApiErrorCode,
     extraHeaders?: Readonly<Record<string, string>>,
+    context?: RejectionContext,
   ): FastifyReply;
   fault(request: FastifyRequest, reply: FastifyReply): FastifyReply;
+  /** Task 011A (B-7): the receipt time for this request's rejection stage. */
+  noteReceivedAt(request: FastifyRequest, receivedAt: Date): void;
+  /** Task 011A (B-7): the canonical UUID parseIntegrationId returned. */
+  noteClaimedIntegrationId(request: FastifyRequest, integrationId: string): void;
+}
+
+/** Task 011A options of the gate; all optional. */
+export interface ResponseGateAuditOptions {
+  /** Fallback clock when no receipt time was noted (default: new Date()). */
+  readonly now?: () => Date;
+  /** RD-15: called once per candidate mapped to HANDLER by fallback, with only the Fastify code. */
+  readonly onUnmapped?: (fastifyCode: string | null) => void;
+}
+
+/**
+ * @internal — RD-15: the rejection stage of a setErrorHandler rejection, by
+ * route, then code. Not on the webhook route → NOT_FOUND (counted only).
+ * On it: body-limit and Content-Length errors → BODY; anything else →
+ * HANDLER, flagged as unmapped (logged once, with only the code).
+ */
+export function stageForErrorHandler(routeUrl: string | undefined, fastifyCode: string | null): RejectionContext {
+  if (routeUrl !== WEBHOOK_ROUTE) return { stage: "NOT_FOUND" };
+  if (fastifyCode === "FST_ERR_CTP_BODY_TOO_LARGE" || fastifyCode === "FST_ERR_CTP_INVALID_CONTENT_LENGTH") {
+    return { stage: "BODY" };
+  }
+  return { stage: "HANDLER", unmappedCode: fastifyCode };
 }
 
 // The single path for every application response (202, errors, 429), and
 // the server-local request state it needs. Created once per buildServer.
 /** @internal — test seam, not public API */
-export function createResponseGate(limiter: RateLimiter): ResponseGate {
+export function createResponseGate(
+  limiter: RateLimiter,
+  audit?: RejectionAuditSink,
+  auditOptions: ResponseGateAuditOptions = {},
+): ResponseGate {
   const peers = new WeakMap<FastifyRequest, PeerKey>();
   const aborted = new WeakSet<FastifyRequest>();
   const individualRejections = new WeakMap<FastifyRequest, ApiErrorCode>();
   const eventIds = new WeakMap<FastifyRequest, string>();
+  // Task 011A (B-7): server-local request state for rejection candidates.
+  const receivedAts = new WeakMap<FastifyRequest, string>();
+  const claimedIntegrationIds = new WeakMap<FastifyRequest, string>();
+
+  function safeSubmit(candidate: RejectionCandidate): void {
+    try {
+      audit?.submit(candidate);
+    } catch {
+      // A throwing sink is a defect, not a request failure (§5.3).
+    }
+  }
+
+  /**
+   * Task 011A (B-3, RD-9): a separate, once-only settlement observer on
+   * reply.raw: "finish" gives FINISH_OBSERVED; "close" before any "finish"
+   * gives CLOSE_BEFORE_FINISH. It submits exactly once, never reads
+   * writableFinished, and attaching it can never affect the response.
+   */
+  function observeRejection(request: FastifyRequest, reply: FastifyReply, code: ApiErrorCode, context: RejectionContext): void {
+    try {
+      const raw = reply.raw as Partial<Pick<NodeJS.EventEmitter, "once">>;
+      if (typeof raw.once !== "function") return;
+      if (context.unmappedCode !== undefined) {
+        try {
+          auditOptions.onUnmapped?.(context.unmappedCode);
+        } catch {
+          // Log-only.
+        }
+      }
+      const receivedAt = receivedAts.get(request) ?? (auditOptions.now ?? (() => new Date()))().toISOString();
+      const candidate = (responseCompletion: ResponseCompletion): RejectionCandidate => ({
+        requestId: request.id,
+        receivedAt,
+        stage: context.stage,
+        httpStatus: statusFor(code) as RejectionCandidate["httpStatus"],
+        errorCode: code as EligibleErrorCode,
+        claimedIntegrationId: claimedIntegrationIds.get(request) ?? null,
+        verifierReason: context.stage === "VERIFIER" ? (context.verifierReason ?? null) : null,
+        responseCompletion,
+      });
+      let submitted = false;
+      const settle = (completion: ResponseCompletion): void => {
+        if (submitted) return;
+        submitted = true;
+        safeSubmit(candidate(completion));
+      };
+      raw.once("finish", () => settle("FINISH_OBSERVED"));
+      raw.once("close", () => settle("CLOSE_BEFORE_FINISH"));
+    } catch {
+      // Never affects the response.
+    }
+  }
 
   function peerOf(request: FastifyRequest): PeerKey {
     return peers.get(request) ?? limiter.peerKey(request.raw.socket?.remoteAddress);
@@ -251,6 +346,7 @@ export function createResponseGate(limiter: RateLimiter): ResponseGate {
     reply: FastifyReply,
     code: ApiErrorCode,
     extraHeaders?: Readonly<Record<string, string>>,
+    context?: RejectionContext,
   ): FastifyReply {
     if (reply.raw.destroyed || !ALLOWANCE_ELIGIBLE.has(code)) {
       return deliver(request, reply, code, extraHeaders);
@@ -263,6 +359,8 @@ export function createResponseGate(limiter: RateLimiter): ResponseGate {
     }
     if (decision.allowed) {
       individualRejections.set(request, code);
+      // Task 011A: step 4 only, so a candidate exists only for a granted rejection.
+      if (audit !== undefined && context !== undefined) observeRejection(request, reply, code, context);
       return deliver(request, reply, code, extraHeaders);
     }
     return send429(request, reply, decision);
@@ -281,6 +379,12 @@ export function createResponseGate(limiter: RateLimiter): ResponseGate {
     send429,
     rejectWith,
     fault,
+    noteReceivedAt: (request, receivedAt) => {
+      receivedAts.set(request, receivedAt.toISOString());
+    },
+    noteClaimedIntegrationId: (request, integrationId) => {
+      claimedIntegrationIds.set(request, integrationId);
+    },
   };
 }
 
@@ -399,6 +503,8 @@ function lateOutcomeFields(settlement: DeadlineSettlement): Record<string, unkno
   }
 }
 
+const ROUTE_GUARD: RejectionContext = Object.freeze({ stage: "ROUTE_GUARD" });
+
 export function buildServer(
   dependencies: ServerDependencies,
   options: ServerOptions = {},
@@ -407,7 +513,12 @@ export function buildServer(
   const now = dependencies.now ?? (() => new Date());
   // Without an injected limiter the evidence half is discarded (HD-18).
   const limiter = dependencies.rateLimiter ?? createRateLimiter().limiter;
-  const gate = createResponseGate(limiter);
+  let appRef: FastifyInstance | undefined;
+  const gate = createResponseGate(limiter, dependencies.rejectionAudit, {
+    now,
+    // RD-15: the server logger, no request bindings, only the Fastify code.
+    onUnmapped: (fastifyCode) => appRef?.log.warn({ event: "REJECTION_STAGE_UNMAPPED", fastifyCode }, "REJECTION_STAGE_UNMAPPED"),
+  });
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const headersTimeoutMs = Math.min(
     options.headersTimeoutMs ?? DEFAULT_HEADERS_TIMEOUT_MS,
@@ -455,6 +566,7 @@ export function buildServer(
     // generic: it never echoes the rejected path or the framework's error
     // code/message.
     frameworkErrors: (error, request, reply) => {
+      gate.noteReceivedAt(request, now());
       // A path parameter over the length limit can only be a malformed
       // integration identifier, which the routing contract answers with 404.
       const code: ApiErrorCode =
@@ -478,9 +590,10 @@ export function buildServer(
         gate.send429(request, reply, decision);
         return;
       }
-      gate.rejectWith(request, reply, code);
+      gate.rejectWith(request, reply, code, undefined, { stage: "ROUTER" });
     },
   });
+  appRef = app;
   app.server.headersTimeout = headersTimeoutMs;
 
   // Only a raw-Buffer `application/json` parser exists. The bytes are
@@ -501,6 +614,7 @@ export function buildServer(
   // P2: peer limits for every routed request (including not-found), before
   // any route work. Registered before the not-found handler and the route.
   app.addHook("onRequest", async (request, reply) => {
+    gate.noteReceivedAt(request, now());
     let peer: PeerKey;
     let decision: Decision;
     try {
@@ -547,16 +661,18 @@ export function buildServer(
     }
     // The remainder of an oversized body must not be read on this socket;
     // the header is applied by deliver(), never to a destroyed reply.
+    const fastifyCode = (error as { code?: unknown }).code;
     return gate.rejectWith(
       request,
       reply,
       code,
       code === "PAYLOAD_TOO_LARGE" ? { connection: "close" } : undefined,
+      stageForErrorHandler(request.routeOptions.url, typeof fastifyCode === "string" ? fastifyCode : null),
     );
   });
 
   app.setNotFoundHandler((request, reply) =>
-    gate.rejectWith(request, reply, "NOT_FOUND"),
+    gate.rejectWith(request, reply, "NOT_FOUND", undefined, { stage: "NOT_FOUND" }),
   );
 
   app.addHook("onResponse", (request, reply, done) => {
@@ -582,26 +698,28 @@ export function buildServer(
     // Runs before the body is consumed: a rejection here never reads it.
     onRequest: async (request, reply) => {
       const receivedAt = now();
+      gate.noteReceivedAt(request, receivedAt);
 
       // 1. Identifier format. Malformed identifiers never reach a lookup.
       const integrationId = parseIntegrationId(request.params.integrationKey);
       if (integrationId === null) {
-        return gate.rejectWith(request, reply, "NOT_FOUND");
+        return gate.rejectWith(request, reply, "NOT_FOUND", undefined, ROUTE_GUARD);
       }
+      gate.noteClaimedIntegrationId(request, integrationId);
 
       // 2. Header guards (duplicates, missing IRS-Signature, content type
       //    and encoding). These run before any secret resolution and
       //    before the body is consumed.
       const headers = evaluateRequestHeaders(request.raw.rawHeaders);
       if (!headers.ok) {
-        return gate.rejectWith(request, reply, headers.code);
+        return gate.rejectWith(request, reply, headers.code, undefined, ROUTE_GUARD);
       }
 
       // 3. Secret resolution, only after the header checks. An identifier
       //    without a configured secret fails closed.
       const secret = dependencies.secrets(integrationId);
       if (secret === undefined) {
-        return gate.rejectWith(request, reply, "NOT_FOUND");
+        return gate.rejectWith(request, reply, "NOT_FOUND", undefined, ROUTE_GUARD);
       }
 
       contexts.set(request, {
@@ -616,7 +734,7 @@ export function buildServer(
     handler: async (request, reply) => {
       const context = contexts.get(request);
       if (context === undefined || !(request.body instanceof Uint8Array)) {
-        return gate.rejectWith(request, reply, "BAD_REQUEST");
+        return gate.rejectWith(request, reply, "BAD_REQUEST", undefined, { stage: "HANDLER" });
       }
 
       // A standalone, exactly-sized copy: the same array is given to the
@@ -633,7 +751,10 @@ export function buildServer(
       });
 
       if (!result.ok) {
-        return gate.rejectWith(request, reply, codeForRejection(result.rejection));
+        return gate.rejectWith(request, reply, codeForRejection(result.rejection), undefined, {
+          stage: "VERIFIER",
+          verifierReason: result.rejection.reason,
+        });
       }
 
       // P6: L3 only after the verifier has accepted signature, timestamp,
@@ -727,14 +848,14 @@ export function buildServer(
         // Task 011 (B-1): a payload with P1/P2, rejected before any ingestion-path
         // database access. Task 011A supplies its rejection stage
         // (INGESTION_PAYLOAD, Amendment Note E6) at this call site.
-        return gate.rejectWith(request, reply, "UNPROCESSABLE_PAYLOAD");
+        return gate.rejectWith(request, reply, "UNPROCESSABLE_PAYLOAD", undefined, { stage: "INGESTION_PAYLOAD" });
       }
       if (status === "INTEGRATION_INELIGIBLE") {
         // Task 011 (B-1): the integration is not ACTIVE, or not registered; only
         // the status-check read ran and nothing was written. The generic 404.
         // Task 011A supplies its rejection stage (INGESTION_INTEGRATION,
         // Amendment Note E7) at this call site.
-        return gate.rejectWith(request, reply, "NOT_FOUND");
+        return gate.rejectWith(request, reply, "NOT_FOUND", undefined, { stage: "INGESTION_INTEGRATION" });
       }
       request.log.error("ingestion handoff returned an invalid outcome");
       return gate.rejectWith(request, reply, "INTERNAL_ERROR");
@@ -747,21 +868,26 @@ export function buildServer(
 /**
  * Closes the server, waiting at most `graceMs` for in-flight requests
  * before forcibly closing remaining connections. Never rejects on timeout.
+ * Task 011A (AD-11): `forced` is true exactly when closeAllConnections()
+ * ran before app.close() settled.
  */
 export async function closeWithGrace(
   app: FastifyInstance,
   graceMs: number,
-): Promise<void> {
+): Promise<{ readonly forced: boolean }> {
   let timer: NodeJS.Timeout | undefined;
-  const forced = new Promise<void>((resolve) => {
+  let forced = false;
+  const forcedClose = new Promise<void>((resolve) => {
     timer = setTimeout(() => {
+      forced = true;
       app.server.closeAllConnections();
       resolve();
     }, graceMs);
   });
   try {
-    await Promise.race([app.close(), forced]);
+    await Promise.race([app.close(), forcedClose]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+  return { forced };
 }

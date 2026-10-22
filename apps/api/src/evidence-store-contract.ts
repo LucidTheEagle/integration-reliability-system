@@ -417,6 +417,27 @@ export function runEvidenceStoreContract(
         });
       });
 
+      it("PA-4: exponent-form and fractional numbers frozen by the production helper round-trip: IDENTICAL_EXISTS, no duplicate", async () => {
+        await withFixture(async (f) => {
+          const instance = randomUUID();
+          const numbers = { tiny: 1e-7, negative: -3.2e-8, extreme: 1e-300, fillRate: 1 / 30, fractionalLarge: 123456789012345.67 };
+          const record = freezeInstanceStarted({
+            id: randomUUID(),
+            limiterInstanceId: instance,
+            scope: f.scope,
+            recordedAt: CONTRACT_T0,
+            instanceStartedAt: CONTRACT_T0,
+            rateLimitPolicies: {},
+            auditPolicies: numbers,
+          });
+          assert.throws(() => withPayload(record, { auditPolicies: { big: 1e21 } }), TypeError);
+          assert.deepEqual(await write(f, record), ["CREATED"]);
+          assert.deepEqual(await write(f, record), ["IDENTICAL_EXISTS"]);
+          assert.deepEqual(await f.readRaw(instance), [asRow(record)]);
+          assert.deepEqual(await write(f, withPayload(record, { auditPolicies: { ...numbers, tiny: 2e-7 } })), ["CONFLICT"]);
+        });
+      });
+
       it("a stored row whose own hash does not match its fields is CONFLICT, even for the identical record", async () => {
         await withFixture(async (f) => {
           const instance = randomUUID();

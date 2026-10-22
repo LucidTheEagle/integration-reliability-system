@@ -846,3 +846,64 @@ describe("real TCP - DEV-1: a destroyed reply at P2 ends the lifecycle", () => {
     });
   }
 });
+
+describe("real TCP - Task 011A AD-11: closeWithGrace reports { forced }", () => {
+  it("an in-flight request that finishes within the grace period (Connection: close) → { forced: false }", async () => {
+    const handoff = new RecordingHandoff(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve({ status: "ACCEPTED" }), 300);
+        }),
+    );
+    const t = await startServer({ handoff });
+    const request = validRequest();
+    // Connection: close, so no keep-alive connection outlives the response.
+    const inflight = rawExchange(
+      t.port,
+      [
+        whole(
+          head([
+            "Content-Type: application/json",
+            `IRS-Signature: ${request.headers["irs-signature"]}`,
+            `Content-Length: ${request.body.byteLength}`,
+          ]),
+          request.body,
+        ),
+      ],
+      { waitMs: 5_000 },
+    );
+    const deadline = Date.now() + 3_000;
+    while (handoff.requests.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(handoff.requests.length, 1);
+    const result = await closeWithGrace(t.app, 3_000);
+    current = undefined;
+    assert.deepEqual(result, { forced: false });
+    assert.equal((await inflight).status, 202);
+  });
+
+  it("a connection still open when the grace period expires → { forced: true }", async () => {
+    const t = await startServer({
+      server: { requestTimeoutMs: 30_000, headersTimeoutMs: 30_000 },
+    });
+    const request = validRequest();
+    const stalled = rawExchange(
+      t.port,
+      [
+        head([
+          "Content-Type: application/json",
+          `IRS-Signature: ${request.headers["irs-signature"]}`,
+          "Content-Length: 1000",
+        ]),
+        "{",
+      ],
+      { waitMs: 5_000 },
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    const result = await closeWithGrace(t.app, 300);
+    current = undefined;
+    assert.deepEqual(result, { forced: true });
+    assert.equal((await stalled).closed, true);
+  });
+});

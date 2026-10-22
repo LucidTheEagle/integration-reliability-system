@@ -574,26 +574,34 @@ describe("A-T22b: U3 registration verification on PostgreSQL (AN4 E5a)", () => {
     const scope = newScope();
     const instance = randomUUID();
     const control = modeHooks(["HOLD"]);
-    const registrationStore = createPostgresEvidenceStore({ db, hooks: control.hooks });
-    const registration = settle(registrationStore.writeEvidenceGroup([started(scope, instance)]));
-    await control.held;
-    const pid = await (control.pids[0] as Promise<number>);
-    await admin.client.query("SELECT pg_terminate_backend($1)", [pid]);
-    control.release();
-    const outcome = await registration;
-    const attempts: RegistrationAttempt[] = [{ outcome: outcome.ok ? "CONFIRMED" : storeErrorOutcome(outcome.error) }];
-    process.stdout.write(
-      `[A-T22b(iv)] the terminated attempt ended ${JSON.stringify({
-        phase: outcome.ok ? null : (outcome.error as { phase?: unknown }).phase ?? null,
-        outcome: attempts[0]?.outcome,
-      })}\n`,
-    );
-    assert.deepEqual(attempts, [{ outcome: "UNKNOWN" }]);
-    assert.equal(await rowCount(instance), 0, "the transaction was terminated before COMMIT");
-    const read = await verify(createPostgresEvidenceStore({ db }), instance);
-    assert.deepEqual(read, { ok: true, present: false });
-    assert.deepEqual(classifyRegistrationVerification({ attempts, recorderAndConsumerStarted: false }, read), {
-      kind: "STILL_UNKNOWN",
-    });
+    // P-011A-15: the terminated backend belongs to its own one-connection pool, never to the
+    // shared pool that the verification read uses.
+    const registrationDb = await guardedDatabase({ url: apiUrl, mode: "api", pool: { maxConnections: 1 } });
+    try {
+      const registrationStore = createPostgresEvidenceStore({ db: registrationDb, hooks: control.hooks });
+      const registration = settle(registrationStore.writeEvidenceGroup([started(scope, instance)]));
+      await control.held;
+      const pid = await (control.pids[0] as Promise<number>);
+      await admin.client.query("SELECT pg_terminate_backend($1)", [pid]);
+      control.release();
+      const outcome = await registration;
+      const attempts: RegistrationAttempt[] = [{ outcome: outcome.ok ? "CONFIRMED" : storeErrorOutcome(outcome.error) }];
+      process.stdout.write(
+        `[A-T22b(iv)] the terminated attempt ended ${JSON.stringify({
+          phase: outcome.ok ? null : (outcome.error as { phase?: unknown }).phase ?? null,
+          outcome: attempts[0]?.outcome,
+        })}\n`,
+      );
+      assert.deepEqual(attempts, [{ outcome: "UNKNOWN" }]);
+      assert.equal(await rowCount(instance), 0, "the transaction was terminated before COMMIT");
+      const read = await verify(createPostgresEvidenceStore({ db }), instance);
+      assert.deepEqual(read, { ok: true, present: false });
+      assert.deepEqual(classifyRegistrationVerification({ attempts, recorderAndConsumerStarted: false }, read), {
+        kind: "STILL_UNKNOWN",
+      });
+    } finally {
+      control.release();
+      await disconnectWithin(registrationDb, 5_000);
+    }
   });
 });

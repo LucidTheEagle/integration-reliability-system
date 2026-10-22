@@ -30,21 +30,22 @@ async function main(): Promise<void> {
     throw error;
   }
 
-  const { app, port, db } = server;
+  const { app, port, db, evidence } = server;
   const steps: LifecycleSteps = {
     verifyReadiness: retryingReadiness(() => verifySchemaReadiness(db), {
       isConnectivityError: (error) => classifyDatabaseError(error).failureClass === "TRANSIENT",
     }),
-    startupSlot: async () => undefined, // SLOT A: Task 011A.
-    verifyRegistration: async () => ({ kind: "STILL_UNKNOWN" }), // SLOT A′: Task 011A; never reached.
+    startupSlot: (signal) => evidence.slots.startupSlot(signal), // SLOT A (Task 011A).
+    verifyRegistration: (deadline) => evidence.slots.verifyRegistration(deadline), // SLOT A′ (U3).
     listen: async () => {
       await app.listen({ host: LISTEN_HOST, port });
     },
-    intakeBarrier: async () => {
-      await closeWithGrace(app, SHUTDOWN_GRACE_MS);
-      return { forced: "NOT_REPORTED" };
+    // AD-11: the barrier reports whether closeWithGrace forced; a server that never listened did not.
+    intakeBarrier: async (reason) => {
+      const { forced } = await closeWithGrace(app, SHUTDOWN_GRACE_MS);
+      return { forced: reason === "LISTEN_FAILED" ? false : forced };
     },
-    finalizeBeforeDisconnect: async () => ({ successAllowed: true }), // SLOT B: Task 011A.
+    finalizeBeforeDisconnect: (reason, intake) => evidence.slots.finalizeBeforeDisconnect(reason, intake), // SLOT B.
     disconnect: () => disconnectWithin(db, DISCONNECT_TIMEOUT_MS),
     budgets: DEFAULT_LIFECYCLE_BUDGETS,
   };

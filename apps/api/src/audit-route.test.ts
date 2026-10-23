@@ -502,4 +502,55 @@ describe("RD-15: setErrorHandler rejections, by route, then code", () => {
     const extra = Object.keys(record).filter((key) => !["level", "time", "pid", "hostname", "msg", "service"].includes(key));
     assert.deepEqual(extra.sort(), ["event", "fastifyCode"]);
   });
+
+  // Checkpoint B addendum (founder decision §21): G1 and G2.
+  it("G1: an ineligible error through setErrorHandler with a sink present (503, 500, no statusCode) → no candidate, no unmapped log", async () => {
+    for (const [label, error, status] of [
+      ["statusCode 503", Object.assign(new Error("synthetic"), { statusCode: 503 }), 503],
+      ["statusCode 500", Object.assign(new Error("synthetic"), { statusCode: 500 }), 500],
+      ["plain Error, no statusCode", new Error("synthetic"), 500],
+    ] as const) {
+      const t = app({
+        verifyWebhook: (() => {
+          throw error;
+        }) as never,
+      });
+      const response = await post(t, validRequest());
+      assert.equal(response.statusCode, status, label);
+      await settleTurns(2);
+      assert.equal(t.sink.candidates.length, 0, label);
+      assert.equal(t.logs.count("REJECTION_STAGE_UNMAPPED"), 0, label);
+    }
+  });
+
+  it("G2: no Fastify code on the webhook route → an eligible 4xx gives one HANDLER candidate and one { event, fastifyCode: null } log; a plain Error gives 500, no candidate, no log", async () => {
+    designatedUnmapped = true;
+    const t = app({
+      verifyWebhook: (() => {
+        throw Object.assign(new Error("synthetic"), { statusCode: 400 });
+      }) as never,
+    });
+    const response = await post(t, validRequest());
+    assert.equal(response.statusCode, 400);
+    await settleTurns(2);
+    assert.equal(t.sink.candidates.length, 1);
+    assertCandidate(t.sink.candidates[0], { stage: "HANDLER", httpStatus: 400, errorCode: "BAD_REQUEST", claimedIntegrationId: INTEGRATION_ID, verifierReason: null }, body(response.body).requestId);
+    assert.equal(t.logs.count("REJECTION_STAGE_UNMAPPED"), 1);
+    const record = t.logs.records().find((entry) => entry.msg === "REJECTION_STAGE_UNMAPPED") as Record<string, unknown>;
+    assert.equal(record.event, "REJECTION_STAGE_UNMAPPED");
+    assert.equal(record.fastifyCode, null);
+    const extra = Object.keys(record).filter((key) => !["level", "time", "pid", "hostname", "msg", "service"].includes(key));
+    assert.deepEqual(extra.sort(), ["event", "fastifyCode"]);
+
+    const plain = app({
+      verifyWebhook: (() => {
+        throw new Error("synthetic");
+      }) as never,
+    });
+    const failed = await post(plain, validRequest());
+    assert.equal(failed.statusCode, 500);
+    await settleTurns(2);
+    assert.equal(plain.sink.candidates.length, 0);
+    assert.equal(plain.logs.count("REJECTION_STAGE_UNMAPPED"), 0);
+  });
 });

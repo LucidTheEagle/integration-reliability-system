@@ -22,23 +22,23 @@ Purpose: the authoritative specification used to guide research, architecture, i
 | Document role                      | Authoritative product and technical baseline                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Owner                              | Founder / System Architect                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Implementation model               | Human-led, AI-assisted                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| Primary code assistant             | Claude                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| Independent reviewer               | Gemini                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Primary code assistant             | Claude Code (implementer). Claude Chat is the design reviewer and prompt author.                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Independent reviewer               | ChatGPT (also the architecture/research partner). Gemini is not currently used.                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Architecture/research partner      | ChatGPT                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | Actual coding environment          | Cursor / VS Code                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Source of truth for implementation | Git repository                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Status                             | Architecture baseline; implementation in progress. Tasks 010, 010A, 011B and 011 are implemented, committed and integrated into local main (at commit 239c161). Phase 3 (Webhook ingestion) remains in progress until Task 011A is implemented and verified.                                                                                                                                                                                                                                 |
+| Status                             | Architecture baseline; implementation in progress. Tasks 010, 010A, 011B, 011 and 011A are implemented, committed and integrated into main (at commit f9dce73, pushed). The Phase 3 (Webhook ingestion) acceptance criteria have been verified locally through automated tests and synthetic testing. The synthetic load results do not establish production capacity or production readiness. Production prerequisites remain open (O-011, O-012, O-013, O-014 and O-015). Phase 4 (Worker processing) is next, beginning with Task 012. |
 | Version                            | 1.0                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | Last updated                       | October 2026                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). 2026-10-13: Task 011B webhook rate-limiting design approved (Section 10 "Webhook rate limiting (Task 011B)"; D-018, D-019, D-020; O-011 added); fixed API error-code set recorded (Section 16); Sections 17, 18 and 19 updated accordingly. Version designation unchanged (V1.0). 2026-10-14: Task 011A webhook security-audit and rate-limit evidence design approved (Section 13 RateLimitEvidence; Section 17 "Webhook rejection and rate-limit evidence (Task 011A)"; D-021, D-022, D-023; O-012 added); Sections 18 and 19 updated accordingly. Version designation unchanged (V1.0). 2026-10-16: Task 011 durable event ingestion design approved (Section 10 "Durable event ingestion (Task 011)" and the Layer 2 rejection-status list; Section 13 Event fields and payload strategy; Section 16 error-code set; Sections 17 and 19; D-024, D-025, D-026, D-027, D-028). Version designation unchanged (V1.0). 2026-10-18: Task 011 implementation recorded: application response deadline added to Section 10 "Durable event ingestion (Task 011)" (Task 011 deviation DEV-2; D-029; O-013 added); Section 19 failure test added; Status updated (Tasks 011B and 011 integrated). Version designation unchanged (V1.0). |
+| Amendment history                  | 2026-10-12: Roadmap amended with Tasks 010A, 011A and 011B and revised Task 011 dependencies; Phase 3 completion gates added; Fastify 5.12.5 accepted (D-015, O-001 resolved); webhook transport boundary documented (Section 10, D-016, D-017); webhook secret mechanism, durable security-audit recording and rate limiting requirements recorded (Section 18); unresolved D-014 reference and Section 13 Operation.integrationId discrepancy noted. Version designation unchanged (V1.0). 2026-10-13: Task 011B webhook rate-limiting design approved (Section 10 "Webhook rate limiting (Task 011B)"; D-018, D-019, D-020; O-011 added); fixed API error-code set recorded (Section 16); Sections 17, 18 and 19 updated accordingly. Version designation unchanged (V1.0). 2026-10-14: Task 011A webhook security-audit and rate-limit evidence design approved (Section 13 RateLimitEvidence; Section 17 "Webhook rejection and rate-limit evidence (Task 011A)"; D-021, D-022, D-023; O-012 added); Sections 18 and 19 updated accordingly. Version designation unchanged (V1.0). 2026-10-16: Task 011 durable event ingestion design approved (Section 10 "Durable event ingestion (Task 011)" and the Layer 2 rejection-status list; Section 13 Event fields and payload strategy; Section 16 error-code set; Sections 17 and 19; D-024, D-025, D-026, D-027, D-028). Version designation unchanged (V1.0). 2026-10-18: Task 011 implementation recorded: application response deadline added to Section 10 "Durable event ingestion (Task 011)" (Task 011 deviation DEV-2; D-029; O-013 added); Section 19 failure test added; Status updated (Tasks 011B and 011 integrated). Version designation unchanged (V1.0). 2026-10-24: Task 011A implementation recorded (main f9dce73): Status updated and Phase 3 recorded as verified locally; Section 18 wording updated; O-014 and O-015 added; Document Control, "How This Document Is Used" and Section 23 aligned with the current AI-assisted working practice; Phase 4 acceptance criteria added (Section 22). Version designation unchanged (V1.0). |
 
 # How This Document Is Used
 
 This document is deliberately broader than a coding prompt. It describes why the product exists, what it is and is not, the business scenario, domain model, workflows, architecture, reliability rules, security boundaries, implementation roadmap, testing expectations, and AI collaboration protocol.
 
-Claude is not the architect of this system. A Claude handoff will always reference this document as the governing context and will add one narrowly scoped task. Claude may propose implementation details, but proposals are not decisions until the architect accepts them.
+Claude is not the architect of this system. A Claude Code handoff will always reference this document as the governing context and will add one narrowly scoped task. Claude Code may propose implementation details, but proposals are not decisions until the architect accepts them.
 
-Gemini is used as an independent technical challenger. Its findings are evidence for review, not automatic architectural changes.
+ChatGPT, as architecture/research partner, also acts as the independent reviewer and challenger. Its findings are evidence for review, not automatic architectural changes. Gemini is not currently used.
 
 The founder remains the final decision-maker. Code is manually integrated into Cursor/VS Code and committed to Git only after review and verification.
 
@@ -935,7 +935,7 @@ Per D-017, webhook secrets are initially supplied through environment-backed con
 
 ## Security-audit recording and rate limiting
 
-- Rejected webhook deliveries must be recorded durably as security-audit evidence, consistent with the EVENT_REJECTED audit event (Section 17) and the Rejected and recorded failure-test expectation (Section 19). Structured application logging is not a substitute for a durable audit record. This requirement is planned as Task 011A and is not implemented by Task 010A.
+- Rejected webhook deliveries must be recorded durably as security-audit evidence, consistent with the EVENT_REJECTED audit event (Section 17) and the Rejected and recorded failure-test expectation (Section 19). Structured application logging is not a substitute for a durable audit record. This requirement is implemented by Task 011A (integrated at f9dce73); Task 010A did not implement it.
 
 - Rate limiting on the webhook endpoint is specified in Section 10 ("Webhook rate limiting (Task 011B)") and by D-018 to D-020. Rejections converted to HTTP 429 because a peer's rejection allowance is exhausted, and all other rate-limited requests, are evidenced through aggregate summaries rather than individual rejection records. Task 011A must record those summaries durably and must record evidence gaps without inventing counts.
 
@@ -1124,13 +1124,33 @@ Phase 3 — Webhook ingestion cannot be declared complete until all of the follo
 
 Task 010A (transport boundary and fail-closed ingestion handoff) does not by itself satisfy any of these criteria.
 
+## Phase 4 acceptance criteria
+
+Phase 4 — Worker processing cannot be declared complete until all of the following are implemented and verified:
+
+- Every accepted event is dispatched for background processing, and an accepted event whose dispatch was lost or never confirmed is detected and dispatched again; no accepted event can remain undispatched without detection (Task 012).
+
+- A queue job delivered or executed more than once produces no duplicate processing side effect (Tasks 012 and 013).
+
+- The worker consumes jobs safely and shuts down without losing work or misreporting the outcome of work in progress (Task 013).
+
+- Every processing attempt is durably recorded with its outcome, timing and failure details (Task 014).
+
+- Every failure is classified into the canonical failure taxonomy (Section 4); UNKNOWN never triggers a destructive action automatically (Task 015).
+
+- Event and operation state transitions follow Section 6, and illegal transitions are rejected.
+
+- PostgreSQL remains the durable source of truth and Redis/BullMQ remains transport only (D-005, D-006).
+
+These criteria define required outcomes, not the dispatch mechanism. Task 012 must separately decide the dispatch and recovery design, including whether it uses an outbox or another approach, and explicitly address whether HTTP acknowledgement timing interacts with queue publication.
+
 # 23. AI-Assisted Engineering Protocol
 
 ## Human architect
 
 The founder owns the system. The founder decides scope, architecture, stack, acceptance, and what code enters the repository.
 
-## ChatGPT — architecture/research partner
+## ChatGPT — architecture/research partner and independent reviewer
 
 - Research current market/technical evidence when needed.
 
@@ -1144,7 +1164,23 @@ The founder owns the system. The founder decides scope, architecture, stack, acc
 
 - Maintain continuity and flag drift.
 
-## Claude — implementation assistant
+- Review independently: design documents, implementation prompts, authorization records, checkpoint reports and evidence bundles, giving an explicit disposition (APPROVABLE / NOT READY / APPROVE MERGE) with specific required corrections.
+
+- Do not implement or take repository actions. Do not make founder-level architecture, scope, acceptance, merge or release decisions. Provide findings and a clear review disposition as a recommendation; the founder retains final decision authority.
+
+## Claude Chat — design reviewer and guide
+
+- Plan each task with the founder.
+
+- Write every Claude Code prompt complete and ready to run.
+
+- Review Claude Code's plans and reports and the partner's reviews.
+
+- Recommend; recommendations are not decisions.
+
+- Label claims as verified or inference; never claim a check happened without evidence.
+
+## Claude Code — implementer
 
 - Receive the master document as context.
 
@@ -1156,7 +1192,11 @@ The founder owns the system. The founder decides scope, architecture, stack, acc
 
 - Return changed files, reasoning, tests, and any deviations.
 
+- Stop at every gate, checkpoint and stop condition; never commit, merge or push.
+
 ## Gemini — independent challenger
+
+- Not currently used. The independent review role is held by ChatGPT.
 
 - Review targeted architecture or code.
 
@@ -1170,13 +1210,13 @@ The founder owns the system. The founder decides scope, architecture, stack, acc
 > ↓\
 > Specific task\
 > ↓\
-> Claude implementation\
+> Claude Code implementation\
 > ↓\
 > Human inspection\
 > ↓\
-> ChatGPT review\
+> Claude Chat review\
 > ↓\
-> Gemini challenge\
+> ChatGPT independent review\
 > ↓\
 > Reconcile findings\
 > ↓\
@@ -1324,6 +1364,8 @@ Unresolved reference: prisma/schema.prisma refers to decision D-014 (Operation e
 | O-011  | Connection-level protection, trusted-proxy client-address derivation (including reassessment of the shared Layer 2 rejection allowance), and handling of Node.js-level malformed-HTTP, framing and timeout events, which are outside all application-level rate-limit guarantees and counters and use non-flat response bodies | Deployment (with O-008); must be resolved before public exposure |
 | O-012  | Multi-instance evidence scoping: deployment-slot scoping versus a liveness lease for detecting abandoned limiter instances (V1 assumes one live API process per scope) | Deployment (with O-008); before running more than one API process |
 | O-013  | Provisional Task 011 timing budgets (AR-3), including the 15 s webhook response deadline, the lifecycle budgets and the pool / transaction timeouts, against target senders' delivery timeouts and the deployment platform | Deployment (with O-008); before public exposure |
+| O-014  | Rejection-audit operability under load (Task 011A P-011A-16): under ingestion saturation, rejection-audit persistence lags and the writer's failure codes are not recorded. Sustained saturation could fill the bounded queue and cause individual audit records to be dropped. droppedQueueFull is counted in memory; that count becomes durable only if a subsequent aggregate summary is persisted, and may be lost if the process terminates first. Decide writer-failure visibility, queue margin and behavior under sustained saturation | Before production load (with O-008) |
+| O-015  | Shutdown evidence completeness with keep-alive clients (Task 011A P-011A-14): a signal shutdown can be reported as forced, so rate-limit and rejection-audit coverage is then never complete; closing idle connections when shutdown begins is deferred to a later apps/api lifecycle task | Before public exposure; in the next server.ts lifecycle task |
 
 # 27. Portfolio Demonstration Plan
 

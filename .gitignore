@@ -70,6 +70,9 @@ web_modules/
 .env.*
 !.env.example
 
+# Local secret files (DR-10b: dev PostgreSQL password); never commit
+secrets/
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache

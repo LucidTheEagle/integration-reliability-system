@@ -1,14 +1,17 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    # postgres:17-alpine, pinned by digest only (DR-10b: the tag+digest form does not resolve locally under the containerd image store)
+    image: postgres@sha256:9beea1b7f176d67e49e23092c63db9e98db32b303ce1b510749379ef46a3dcdd
     container_name: irs-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: irs_dev
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -36,4 +39,9 @@ services:
 
 volumes:
   postgres_data:
+    name: irs-dev-postgres-data
   redis_data:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password

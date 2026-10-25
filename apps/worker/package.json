@@ -1,0 +1,11 @@
+{
+  "name": "@irs/worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Background worker for the Integration Reliability System (Redis/BullMQ event dispatch).",
+  "type": "module",
+  "dependencies": {
+    "bullmq": "6.4.1",
+    "ioredis": "5.11.1"
+  }
+}

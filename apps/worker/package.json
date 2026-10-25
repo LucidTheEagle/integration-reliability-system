@@ -4,7 +4,13 @@
   "private": true,
   "description": "Background worker for the Integration Reliability System (Redis/BullMQ event dispatch).",
   "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "pnpm run build && node --test \"dist/**/!(*.redis).test.js\"",
+    "test:redis": "pnpm run build && node dist/test-support/redis-preflight.js && node --test --test-concurrency=1 \"dist/**/*.redis.test.js\""
+  },
   "dependencies": {
+    "@irs/config": "workspace:^",
     "bullmq": "6.4.1",
     "ioredis": "5.11.1"
   }

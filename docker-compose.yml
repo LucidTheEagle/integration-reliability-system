@@ -1,3 +1,5 @@
+name: integration-reliability-system
+
 services:
   postgres:
     # postgres:17-alpine, pinned by digest only (DR-10b: the tag+digest form does not resolve locally under the containerd image store)
@@ -22,16 +24,20 @@ services:
       start_period: 5s
 
   redis:
-    image: redis:7-alpine
+    # redis:7.4.11-alpine, pinned by digest only (Task 012A record D2)
+    image: redis@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
     container_name: irs-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--aclfile", "/run/secrets/redis_acl", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "everysec"]
+    secrets:
+      - redis_acl
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Credential-free (D12): PONG, or the NOAUTH refusal of an unauthenticated PING, means alive
+      test: ["CMD-SHELL", "redis-cli ping 2>&1 | head -n 1 | grep -Eq '^(PONG|NOAUTH)'"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -41,7 +47,10 @@ volumes:
   postgres_data:
     name: irs-dev-postgres-data
   redis_data:
+    name: irs-dev-redis-data
 
 secrets:
   postgres_password:
     file: ./secrets/postgres_password
+  redis_acl:
+    file: ./secrets/redis_users.acl

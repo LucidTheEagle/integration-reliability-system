@@ -38,6 +38,9 @@ importers:
 
   apps/worker:
     dependencies:
+      '@irs/config':
+        specifier: workspace:^
+        version: link:../../packages/config
       bullmq:
         specifier: 6.4.1
         version: 6.4.1(ioredis@5.11.1)(pg@8.23.1)

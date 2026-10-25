@@ -1,0 +1,34 @@
+# Test Redis for @irs/worker's test:redis suite (DR-11; Task 012A record D7, D17).
+# A separate Compose project, so Compose commands for the development project never act on it.
+# Started only with --pull never. No environment variable carries a password: the server reads
+# only the hash, from the untracked ACL file mounted as a Compose secret.
+name: irs-test-redis
+
+services:
+  redis:
+    # redis:7.4.11-alpine, pinned by digest only (Task 012A record D2)
+    image: redis@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
+    container_name: irs-test-redis
+    restart: "no"
+    command: ["redis-server", "--aclfile", "/run/secrets/redis_test_acl", "--maxmemory", "64mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes", "--appendfsync", "everysec"]
+    secrets:
+      - redis_test_acl
+    ports:
+      - "127.0.0.1:46379:6379"
+    volumes:
+      - redis_test_data:/data
+    healthcheck:
+      # Credential-free (D12): PONG, or the NOAUTH refusal of an unauthenticated PING, means alive
+      test: ["CMD-SHELL", "redis-cli ping 2>&1 | head -n 1 | grep -Eq '^(PONG|NOAUTH)'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  redis_test_data:
+    name: irs-test-redis-data
+
+secrets:
+  redis_test_acl:
+    file: ./secrets/redis_test_users.acl

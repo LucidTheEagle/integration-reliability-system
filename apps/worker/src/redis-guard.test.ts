@@ -4,9 +4,13 @@ import { join } from "node:path";
 import { REPOSITORY_ROOT } from "./repository-root.js";
 import {
   REGISTERED_TARGET,
+  RedisCommandFailure,
   RedisConnectionFailure,
   RedisGuardRefusal,
-  connectGuarded,
+  checkGuardCheckScope,
+  checkGuardedEndpoint,
+  checkSentinelValue,
+  guardCheckSentinel,
   redisErrorCode,
   safeReason,
   validateRedisTarget,
@@ -14,8 +18,9 @@ import {
 import type { RedisGuardCheck, RedisTestTarget } from "./test-support/redis-guard.js";
 import {
   GUARD_CHECK_DATABASE_INDEX,
-  TEST_QUEUE_PREFIX,
-  testQueueName,
+  MAIN_DATABASE_INDEX,
+  SENTINEL_KEY,
+  SENTINEL_MARKER,
 } from "./test-support/redis-registry.js";
 
 // Redis-free guard refusals (DR-11; Task 012A record D7, D17). No connection
@@ -98,9 +103,47 @@ describe("redis guard: pre-connect checks", () => {
 
   it("refuses before connecting or reading the password file", async () => {
     await assert.rejects(
-      connectGuarded(target({ passwordFile: "secrets/redis_password" }), CLEAN_ENV),
+      checkGuardedEndpoint(target({ passwordFile: "secrets/redis_password" }), CLEAN_ENV),
       (error: unknown) => error instanceof RedisGuardRefusal && error.check === "password-source",
     );
+  });
+});
+
+describe("redis guard: the sentinel check on a GET reply", () => {
+  it("accepts exactly the registered marker", () => {
+    checkSentinelValue(SENTINEL_MARKER);
+  });
+
+  it("refuses a missing key and any other value, never echoing the value", () => {
+    refusedBy("sentinel-missing", () => checkSentinelValue(null));
+    for (const value of ["", "not-the-marker", `${SENTINEL_MARKER} `, SENTINEL_MARKER.toUpperCase()]) {
+      refusedBy("sentinel-mismatch", () => checkSentinelValue(value), value === "" ? [] : [value]);
+    }
+  });
+});
+
+describe("redis guard: DF-3's guard-check sentinel helper", () => {
+  it("its scope check accepts only the sentinel key in the guard-check database", () => {
+    checkGuardCheckScope(GUARD_CHECK_DATABASE_INDEX, SENTINEL_KEY);
+  });
+
+  it("its scope check refuses database 0, any other database and any other key", () => {
+    refusedBy("guard-check-scope", () => checkGuardCheckScope(MAIN_DATABASE_INDEX, SENTINEL_KEY));
+    for (const db of [2, 15, -1]) {
+      refusedBy("guard-check-scope", () => checkGuardCheckScope(db, SENTINEL_KEY));
+    }
+    for (const key of ["irs-test-x-0:key", "irs:test:sentinel:other", "", "*"]) {
+      refusedBy("guard-check-scope", () => checkGuardCheckScope(GUARD_CHECK_DATABASE_INDEX, key));
+    }
+  });
+
+  it("is frozen, with exactly its three operations, none taking a key or a database argument", () => {
+    assert.ok(Object.isFrozen(guardCheckSentinel));
+    assert.deepEqual(Reflect.ownKeys(guardCheckSentinel).sort(), ["deleteKey", "setMarker", "setWrongValue"]);
+    for (const operation of Object.values(guardCheckSentinel)) {
+      assert.equal(typeof operation, "function");
+      assert.equal(operation.length, 0, "no parameter");
+    }
   });
 });
 
@@ -120,15 +163,7 @@ describe("redis guard: error classification", () => {
 
   it("prints only typed messages or a code", () => {
     assert.equal(safeReason(new RedisConnectionFailure("ECONNREFUSED")), "test-Redis connection failed (ECONNREFUSED)");
+    assert.equal(safeReason(new RedisCommandFailure("OOM")), "test-Redis command failed (OOM)");
     assert.equal(safeReason(new Error("a raw message")), "unexpected error (UNCLASSIFIED)");
-  });
-});
-
-describe("redis registry: per-test queue names", () => {
-  it("prefixes every test queue name and makes each one unique", () => {
-    const first = testQueueName("guard");
-    const second = testQueueName("guard");
-    assert.ok(first.startsWith(TEST_QUEUE_PREFIX));
-    assert.notEqual(first, second);
   });
 });

@@ -3,15 +3,17 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { openDispatchQueue, publishDispatchJob, startDispatchWorker } from "./dispatch-queue/index.js";
 import { QUEUE_HANDLE_METHODS, WORKER_HANDLE_METHODS, handleSurfaceProblems } from "./test-support/handle-surface.js";
-import { guardedDispatchSettings, waitUntil } from "./test-support/dispatch-redis.js";
+import { waitUntil } from "./test-support/dispatch-redis.js";
+import { guardedDispatchSettings, issueTestNamespace } from "./test-support/redis-guard.js";
 
 // 012A-3 step 4a, against the test Redis (127.0.0.1:46379), under this test's
-// own key prefix. Publication only through publishDispatchJob; every read
-// through the queue handle's read-only inspection.
+// own key namespace, cleaned up after the test (D-F2). Publication only
+// through publishDispatchJob; every read through the queue handle's
+// read-only inspection.
 
 describe("dispatch queue (Redis): smoke", () => {
-  it("publishes, reads back by id, suppresses a second publish of the same event, and exposes only the designed methods", async () => {
-    const settings = await guardedDispatchSettings("dispatch-smoke");
+  it("publishes, reads back by id, suppresses a second publish of the same event, and exposes only the designed methods", async (t) => {
+    const settings = await guardedDispatchSettings(issueTestNamespace(t, "dispatch-smoke"));
     const queue = openDispatchQueue(settings);
     try {
       assert.deepEqual(handleSurfaceProblems(queue, QUEUE_HANDLE_METHODS), []);

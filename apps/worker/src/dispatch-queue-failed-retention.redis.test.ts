@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { openDispatchQueue, publishDispatchJob, startDispatchWorker } from "./dispatch-queue/index.js";
 import type { DispatchJobView, DispatchQueueHandle } from "./dispatch-queue/index.js";
-import { guardedDispatchSettings, waitUntil } from "./test-support/dispatch-redis.js";
+import { waitUntil } from "./test-support/dispatch-redis.js";
+import { guardedDispatchSettings, issueTestNamespace } from "./test-support/redis-guard.js";
 
 // 012A-3 step 4b (addendum §3.2 rule 6b): a failed dispatch job, failed
 // through startDispatchWorker, survives repeated later failures and repeated
@@ -12,7 +13,8 @@ import { guardedDispatchSettings, waitUntil } from "./test-support/dispatch-redi
 // successive workers from startDispatchWorker. In the original probes (P1e
 // E3, cases 1 and 2) a single later failure under a count- or age-based
 // policy was enough to evict; this test makes 25 later failures and 25 later
-// completions (more than the 21 failures of P1e's case-3 control).
+// completions (more than the 21 failures of P1e's case-3 control). The keys
+// live under this test's own namespace, cleaned up after it (D-F2).
 
 const LATER_FAILURES = 25;
 const LATER_COMPLETIONS = 25;
@@ -33,8 +35,8 @@ async function settled(queue: DispatchQueueHandle, ids: readonly string[]): Prom
 }
 
 describe("dispatch queue (Redis): failed-job retention", () => {
-  it("keeps the first failed job through later failures and completions", async () => {
-    const settings = await guardedDispatchSettings("dispatch-failed-retention");
+  it("keeps the first failed job through later failures and completions", async (t) => {
+    const settings = await guardedDispatchSettings(issueTestNamespace(t, "dispatch-failed-retention"));
     const first = openDispatchQueue(settings);
     const second = openDispatchQueue(settings);
     try {

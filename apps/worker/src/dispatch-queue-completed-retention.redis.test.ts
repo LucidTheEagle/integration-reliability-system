@@ -3,14 +3,16 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { openDispatchQueue, publishDispatchJob, startDispatchWorker } from "./dispatch-queue/index.js";
 import type { DispatchJobView } from "./dispatch-queue/index.js";
-import { guardedDispatchSettings, usedMemoryBytes, waitUntil } from "./test-support/dispatch-redis.js";
+import { waitUntil } from "./test-support/dispatch-redis.js";
+import { guardedDispatchSettings, issueTestNamespace, usedMemoryBytes } from "./test-support/redis-guard.js";
 
 // 012A-3 step 4c (addendum §3.2 rule 6c, §3.4): with the module's own
 // removeOnComplete { age: 3600, count: 5000 }, 5,200 jobs complete after a
 // failed job exists. Completed-job cleanup then trims the completed set on
 // each of the last 200 completions; the failed job must still be retained and
 // the completed count must not exceed 5,000. Bounded at 5 minutes; the Redis
-// memory this run adds is bounded at 32 MiB (estimated about 8-10 MB).
+// memory this run adds is bounded at 32 MiB (estimated about 8-10 MB). The
+// keys live under this test's own namespace, cleaned up after it (D-F2).
 
 const COMPLETIONS = 5_200;
 const POLICY_COUNT = 5_000;
@@ -19,7 +21,7 @@ const MEMORY_BOUND_BYTES = 32 * 1024 * 1024;
 
 describe("dispatch queue (Redis): completed-job cleanup never removes a failed job", () => {
   it(`completes ${COMPLETIONS} jobs after a failure; the failed job stays, completed <= ${POLICY_COUNT}`, { timeout: 300_000 }, async (t) => {
-    const settings = await guardedDispatchSettings("dispatch-completed-retention");
+    const settings = await guardedDispatchSettings(issueTestNamespace(t, "dispatch-completed-retention"));
     const memoryBefore = await usedMemoryBytes();
     const started = Date.now();
     const queue = openDispatchQueue(settings);

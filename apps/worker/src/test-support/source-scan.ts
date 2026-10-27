@@ -511,6 +511,388 @@ export function scanPackage(root: string): PackageScan {
   return { files, violations, constructions, libraryImports };
 }
 
+// ---- Redis client access (012B record Part A2 DF-1) -----------------------
+
+/** The Redis client's package name. */
+export const CLIENT_PACKAGE = ["io", "redis"].join("");
+/** The client's classes; constructing one is constructing a raw client. */
+const CLIENT_CLASSES: readonly string[] = ["Redis", "Cluster"];
+
+/**
+ * Redis commands and queue operations that delete keys or jobs (D-F2; the
+ * 012B-1 prompt's list, plus GETDEL and the EXPIRE family, which delete a key
+ * at once or later). Matched case-insensitively, as a member name or as a
+ * whole string.
+ */
+export const DELETING_COMMANDS: readonly string[] = Object.freeze(
+  [
+    ["d", "el"],
+    ["un", "link"],
+    ["ge", "tdel"],
+    ["flush", "all"],
+    ["flush", "db"],
+    ["obli", "terate"],
+    ["dr", "ain"],
+    ["cl", "ean"],
+    ["re", "move"],
+    ["ex", "pire"],
+    ["pex", "pire"],
+    ["ex", "pireat"],
+    ["pex", "pireat"],
+  ].map((parts) => parts.join("")),
+);
+
+export interface DeletionLocation {
+  readonly file: string;
+  /** The named function declaration the command is written in. */
+  readonly function: string;
+  readonly command: string;
+}
+
+export interface RedisClientAllowlist {
+  /** (i) Modules permitted to import the client package or construct a raw client. */
+  readonly clientModules: readonly string[];
+  /** (ii) Modules permitted to export or return a raw client. */
+  readonly clientExporters: readonly string[];
+  /** (iii) The only places a deleting command may be written: file, function and command. */
+  readonly deletionLocations: readonly DeletionLocation[];
+  /** (iv) The namespace-issuer factory: its name, and the module that declares it. */
+  readonly issuerFactory: string;
+  readonly issuerModule: string;
+  /** (iv) The only files that may import and call the factory (founder correction S1-C2). */
+  readonly issuerCallers: readonly string[];
+}
+
+const UNLINK = ["un", "link"].join("");
+const DEL = ["d", "el"].join("");
+
+/**
+ * The DF-1 allowlist: the raw Redis client lives in redis-guard.ts only and
+ * leaves it nowhere. Deletion is written only in the namespace cleanup (the
+ * store's UNLINK and the algorithm that calls it, D-F2 rule 1) and in DF-3's
+ * guard-check sentinel DEL. The namespace-issuer factory is called only to
+ * bind the issuer every Redis test uses (redis-guard.ts) and by the in-memory
+ * unit tests (test-namespace.test.ts); nothing else imports, calls or
+ * re-exports it.
+ */
+export const REDIS_CLIENT_ALLOWLIST: RedisClientAllowlist = Object.freeze({
+  clientModules: Object.freeze(["src/test-support/redis-guard.ts"]),
+  clientExporters: Object.freeze([]),
+  deletionLocations: Object.freeze([
+    Object.freeze({ file: "src/test-support/redis-guard.ts", function: "openNamespaceStore", command: UNLINK }),
+    Object.freeze({ file: "src/test-support/test-namespace.ts", function: "unlinkOwnedKeys", command: UNLINK }),
+    Object.freeze({ file: "src/test-support/redis-guard.ts", function: "deleteGuardCheckSentinel", command: DEL }),
+  ]),
+  issuerFactory: "createNamespaceIssuer",
+  issuerModule: "src/test-support/test-namespace.ts",
+  issuerCallers: Object.freeze(["src/test-support/redis-guard.ts", "src/test-namespace.test.ts"]),
+});
+
+export interface IssuerCallSite {
+  readonly file: string;
+  readonly line: number;
+}
+
+export interface RedisAccessScan {
+  readonly violations: readonly Violation[];
+  /** Every permitted deleting command found, one entry per occurrence. */
+  readonly deletions: readonly DeletionLocation[];
+  /** Every permitted call of the namespace-issuer factory found. */
+  readonly issuerCalls: readonly IssuerCallSite[];
+}
+
+function isClientSpecifier(value: string): boolean {
+  return value === CLIENT_PACKAGE || value.startsWith(`${CLIENT_PACKAGE}/`);
+}
+
+/** Index of the `{` that opens a function body, after the parameter list closing at `close`; -1 if none. */
+function bodyOpenIndex(tokens: readonly Token[], close: number): number {
+  let depth = 0;
+  for (let k = close + 1; k < tokens.length; k++) {
+    const token = tokens[k];
+    if (token?.kind !== "punctuator") continue;
+    if (["(", "[", "<"].includes(token.value)) depth++;
+    else if ([")", "]", ">"].includes(token.value)) depth--;
+    else if (token.value === ";" && depth === 0) return -1;
+    else if (token.value === "{" && depth === 0) {
+      // A `{` right after `:`, `|`, `&` or `,` begins an object type, not the body.
+      const previous = tokens[k - 1];
+      if (previous?.kind === "punctuator" && [":", "|", "&", ","].includes(previous.value)) {
+        k = closingIndex(tokens, k);
+        if (k === -1) return -1;
+        continue;
+      }
+      return k;
+    }
+  }
+  return -1;
+}
+
+interface FunctionSpan {
+  readonly name: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+/** The body spans of every named function declaration (`function name(...) {...}`). */
+function functionSpans(tokens: readonly Token[]): FunctionSpan[] {
+  const spans: FunctionSpan[] = [];
+  tokens.forEach((token, k) => {
+    if (!isIdentifier(token, "function") || isPunctuator(tokens[k - 1], ".")) return;
+    let j = k + 1;
+    if (isPunctuator(tokens[j], "*")) j++;
+    const name = tokens[j];
+    if (name === undefined || name.kind !== "identifier") return;
+    let open = j + 1;
+    if (isPunctuator(tokens[open], "<")) open = closingIndex(tokens, open) + 1;
+    if (open === 0 || !isPunctuator(tokens[open], "(")) return;
+    const close = closingIndex(tokens, open);
+    if (close === -1) return;
+    const body = bodyOpenIndex(tokens, close);
+    if (body === -1) return;
+    const end = closingIndex(tokens, body);
+    if (end !== -1) spans.push({ name: name.value, start: body, end });
+  });
+  return spans;
+}
+
+function enclosingFunction(spans: readonly FunctionSpan[], index: number): string | undefined {
+  let found: FunctionSpan | undefined;
+  for (const span of spans) {
+    if (span.start < index && index < span.end && (found === undefined || span.start > found.start)) found = span;
+  }
+  return found?.name;
+}
+
+/** Token indexes of an export statement, for the raw-client export rule: a declaration's signature or whole body. */
+function exportStatementRange(tokens: readonly Token[], k: number): [number, number] {
+  let j = k + 1;
+  while (isIdentifier(tokens[j], "declare") || isIdentifier(tokens[j], "async") || isIdentifier(tokens[j], "default")) j++;
+  if (isIdentifier(tokens[j], "function")) {
+    let open = j + 1;
+    while (open < tokens.length && !isPunctuator(tokens[open], "(")) open++;
+    const close = closingIndex(tokens, open);
+    const body = close === -1 ? -1 : bodyOpenIndex(tokens, close);
+    return [k, body === -1 ? tokens.length : body];
+  }
+  if (["interface", "class", "enum"].some((word) => isIdentifier(tokens[j], word))) {
+    let open = j + 1;
+    while (open < tokens.length && !isPunctuator(tokens[open], "{")) open++;
+    const close = closingIndex(tokens, open);
+    return [k, close === -1 ? tokens.length : close + 1];
+  }
+  // const, let, var, type, `export { ... }` and `export =`: up to the `;` at depth 0.
+  let depth = 0;
+  for (let m = j; m < tokens.length; m++) {
+    const token = tokens[m];
+    if (token?.kind !== "punctuator") continue;
+    if (["(", "[", "{"].includes(token.value)) depth++;
+    else if ([")", "]", "}"].includes(token.value)) depth--;
+    else if (token.value === ";" && depth === 0) return [k, m];
+  }
+  return [k, tokens.length];
+}
+
+/**
+ * Scans one source file against the DF-1 allowlist. `file` is its path
+ * relative to the @irs/worker package root, with forward slashes.
+ */
+export function scanRedisAccess(
+  file: string,
+  text: string,
+  allowlist: RedisClientAllowlist = REDIS_CLIENT_ALLOWLIST,
+): RedisAccessScan {
+  const violations: Violation[] = [];
+  const deletions: DeletionLocation[] = [];
+  const report = (rule: string, line: number) => violations.push({ rule, file, line });
+  const clientModule = allowlist.clientModules.includes(file);
+  const clientExporter = allowlist.clientExporters.includes(file);
+  const tokens = tokenize(text);
+
+  // (i) Imports of the client package: only in a client module, and only as a
+  // static import; a re-export would hand the client out (ii).
+  const accepted = new Set<number>();
+  const clientNames = new Set<string>(CLIENT_CLASSES);
+  for (const statement of importStatements(tokens)) {
+    const token = tokens[statement.specifier];
+    if (token === undefined || !isClientSpecifier(token.value)) continue;
+    accepted.add(statement.specifier);
+    if (!clientModule) {
+      report("redis-client-import", token.line);
+    } else if (statement.kind === "re-export") {
+      if (!clientExporter) report("redis-client-export", token.line);
+    } else if (statement.kind !== "static") {
+      report("redis-client-import-form", token.line);
+    } else {
+      for (let m = statement.clauseStart; m < statement.clauseEnd; m++) {
+        const name = tokens[m];
+        if (name?.kind === "identifier" && !["type", "as", "from", "import"].includes(name.value)) clientNames.add(name.value);
+      }
+    }
+  }
+  tokens.forEach((token, k) => {
+    if ((token.kind === "string" || token.kind === "template") && isClientSpecifier(token.value) && !accepted.has(k)) {
+      report(clientModule ? "redis-client-other-reference" : "redis-client-import", token.line);
+    }
+  });
+
+  // (i) Constructions of a raw client, outside a client module.
+  tokens.forEach((token, k) => {
+    if (clientModule || !isIdentifier(token, "new")) return;
+    let j = k + 1;
+    while (isIdentifier(tokens[j]) && isPunctuator(tokens[j + 1], ".")) j += 2;
+    const name = tokens[j];
+    if (name?.kind === "identifier" && clientNames.has(name.value)) report("redis-client-construction", name.line);
+  });
+
+  // (ii) In a client module, no export's signature or declaration names the client.
+  if (clientModule && !clientExporter) {
+    tokens.forEach((token, k) => {
+      if (!isIdentifier(token, "export") || isPunctuator(tokens[k - 1], ".")) return;
+      const [start, end] = exportStatementRange(tokens, k);
+      for (let m = start; m < end; m++) {
+        const inner = tokens[m];
+        if (inner?.kind === "identifier" && clientNames.has(inner.value)) {
+          report("redis-client-export", inner.line);
+          return;
+        }
+      }
+    });
+  }
+
+  // (iii) Deleting commands, as a member name or a whole string, only where allowed.
+  const spans = functionSpans(tokens);
+  tokens.forEach((token, k) => {
+    const member = token.kind === "identifier" && isPunctuator(tokens[k - 1], ".");
+    const literal = token.kind === "string" || token.kind === "template";
+    if (!member && !literal) return;
+    const command = token.value.toLowerCase();
+    if (!DELETING_COMMANDS.includes(command)) return;
+    const name = enclosingFunction(spans, k);
+    const allowed = allowlist.deletionLocations.find(
+      (location) => location.file === file && location.function === name && location.command === command,
+    );
+    if (allowed === undefined) report("deleting-command", token.line);
+    else deletions.push(allowed);
+  });
+
+  // (iv) The namespace-issuer factory: imported by name and called only in its
+  // permitted files; never re-exported, aliased, or reached through a
+  // namespace or dynamic import of its module (founder correction S1-C2).
+  const issuerCalls: IssuerCallSite[] = [];
+  const factory = allowlist.issuerFactory;
+  const factoryModule = allowlist.issuerModule.replace(SPECIFIER_EXTENSION, "");
+  const builtModule = factoryModule.replace(/^src\//, "dist/");
+  const declaring = file === allowlist.issuerModule;
+  const caller = allowlist.issuerCallers.includes(file);
+  const handled = new Set<number>();
+  const aliases = new Set<string>();
+  for (const statement of importStatements(tokens)) {
+    const specifier = tokens[statement.specifier];
+    if (specifier === undefined) continue;
+    const target = resolveSpecifier(file, specifier.value);
+    if (target !== factoryModule && target !== builtModule) continue;
+    const clause: number[] = [];
+    for (let m = statement.clauseStart; m < statement.clauseEnd; m++) clause.push(m);
+    const star = clause.some((m) => isPunctuator(tokens[m], "*"));
+    if (statement.kind === "re-export") {
+      if (star) report("issuer-re-export", specifier.line);
+      for (const m of clause) {
+        if (!isIdentifier(tokens[m], factory)) continue;
+        handled.add(m);
+        report("issuer-re-export", specifier.line);
+      }
+    } else if (statement.kind === "dynamic" || statement.kind === "require") {
+      report("issuer-dynamic-import", specifier.line);
+    } else if (statement.kind === "static") {
+      if (star) report("issuer-namespace-import", specifier.line);
+      for (const m of clause) {
+        if (!isIdentifier(tokens[m], factory)) continue;
+        handled.add(m);
+        const alias = tokens[m + 2];
+        if (isIdentifier(tokens[m + 1], "as") && alias?.kind === "identifier") {
+          aliases.add(alias.value);
+          handled.add(m + 2);
+          report("issuer-alias", specifier.line);
+        } else if (!caller) {
+          report("issuer-import", specifier.line);
+        }
+      }
+    }
+  }
+  tokens.forEach((token, k) => {
+    if (token.kind !== "identifier" || handled.has(k)) return;
+    const call = isPunctuator(tokens[k + 1], "(") && !isPunctuator(tokens[k - 1], ".");
+    if (aliases.has(token.value)) {
+      if (call) report("issuer-call", token.line);
+      return;
+    }
+    if (token.value !== factory) return;
+    // Its own declaration, in the module that declares it.
+    if (declaring && isIdentifier(tokens[k - 1], "function")) return;
+    if (caller && call) issuerCalls.push({ file, line: token.line });
+    else report(call ? "issuer-call" : "issuer-reference", token.line);
+  });
+
+  return { violations, deletions, issuerCalls };
+}
+
+export interface PackageRedisAccessScan extends RedisAccessScan {
+  /** Every scanned file, relative to the package root. */
+  readonly files: readonly string[];
+}
+
+/** scanRedisAccess over every source file of the package, tracked or not (dist and node_modules excluded). */
+export function scanPackageRedisAccess(
+  root: string,
+  allowlist: RedisClientAllowlist = REDIS_CLIENT_ALLOWLIST,
+): PackageRedisAccessScan {
+  const { files, links } = listSourceFiles(root);
+  const violations: Violation[] = links.map((file) => ({ rule: "unscanned-link", file, line: 0 }));
+  const deletions: DeletionLocation[] = [];
+  const issuerCalls: IssuerCallSite[] = [];
+  for (const file of files) {
+    const scan = scanRedisAccess(file, readFileSync(join(root, file), "utf8"), allowlist);
+    violations.push(...scan.violations);
+    deletions.push(...scan.deletions);
+    issuerCalls.push(...scan.issuerCalls);
+  }
+  return { files, violations, deletions, issuerCalls };
+}
+
+/**
+ * (ii), on the build output: every declaration file under `directory` that
+ * names the client package (an import, an inline import type, a reference
+ * directive) exports or returns a raw-client type. Returns those findings and
+ * the files checked.
+ */
+export function scanDeclarationsForClient(directory: string): { files: string[]; violations: Violation[] } {
+  const files: string[] = [];
+  const violations: Violation[] = [];
+  const directive = new RegExp(`^\\s*///\\s*<reference\\b.*\\b${CLIENT_PACKAGE}\\b`, "im");
+  const walk = (current: string) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== "node_modules") walk(path);
+      } else if (entry.isFile() && entry.name.endsWith(".d.ts")) {
+        const file = relative(directory, path).split(sep).join("/");
+        files.push(file);
+        const text = readFileSync(path, "utf8");
+        if (directive.test(text)) violations.push({ rule: "declaration-client-directive", file, line: 0 });
+        for (const token of tokenize(text)) {
+          const named =
+            ((token.kind === "string" || token.kind === "template") && isClientSpecifier(token.value)) ||
+            (token.kind === "identifier" && token.value === CLIENT_PACKAGE);
+          if (named) violations.push({ rule: "declaration-client-reference", file, line: token.line });
+        }
+      }
+    }
+  };
+  walk(directory);
+  return { files: files.sort(), violations };
+}
+
 // ---- declaration surface --------------------------------------------------
 
 export interface DeclarationScan {

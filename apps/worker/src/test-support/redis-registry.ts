@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto";
-
 // Test-Redis registry (DR-11; Task 012A record D7, D17). Everything the guard
 // accepts is named here; anything not named is refused.
 
@@ -32,9 +30,15 @@ export const EXPECTED_SERVER_CONFIG: Readonly<Record<string, string>> = {
   appendfsync: "everysec",
 };
 
-/** Tests never flush: each uses its own queue name under this prefix. */
-export const TEST_QUEUE_PREFIX = "irs-test-";
+/**
+ * The stem of every test key namespace (D-F2 rule 1). A namespace is
+ * `irs-test-<label>-<uuid>`, issued only by issueTestNamespace; its keys are
+ * `<namespace>:...`. Nothing is ever flushed.
+ */
+export const TEST_NAMESPACE_STEM = "irs-test-";
 
-export function testQueueName(label: string): string {
-  return `${TEST_QUEUE_PREFIX}${label}-${randomUUID()}`;
-}
+/**
+ * The preflight's memory threshold (D-F2 item 4): it passes at or below 24 MiB
+ * of used_memory and refuses above it ("founder reset required").
+ */
+export const USED_MEMORY_LIMIT_BYTES = 25_165_824;

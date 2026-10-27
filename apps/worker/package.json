@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "pnpm run build && node --test \"dist/**/!(*.redis).test.js\"",
-    "test:redis": "pnpm run build && node dist/test-support/redis-preflight.js && node --test --test-concurrency=1 \"dist/**/*.redis.test.js\""
+    "test:redis": "pnpm run build && node dist/test-support/redis-suite.js"
   },
   "dependencies": {
     "@irs/config": "workspace:^",

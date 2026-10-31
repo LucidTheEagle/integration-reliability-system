@@ -337,11 +337,14 @@ const DESIGNED_EXPORTS: Readonly<Record<string, readonly string[]>> = {
     "bootstrapSentinel",
     "checkGuardCheckScope",
     "checkGuardedEndpoint",
+    "checkSelectedDatabase",
     "checkSentinelValue",
+    "describeClientInfoShape",
     "guardCheckSentinel",
     "guardedDispatchSettings",
     "issueTestNamespace",
     "namespaceKeyCount",
+    "observeClientInfoShape",
     "readServerBaseline",
     "redisErrorCode",
     "safeReason",
@@ -487,6 +490,53 @@ function exportSurface(moduleName: string, exports: object, designed: readonly s
   }
   return { problems, argumentTakers, deleters };
 }
+
+describe("Q4 (Task 012B, PL-11): the DF-3 refusal path is wired", () => {
+  const source = readFileSync(join(PACKAGE_ROOT, GUARD_FILE), "utf8");
+
+  /** The body of a module-level function declaration, by its exact head, up to its closing brace at column 0. */
+  function body(text: string, head: string): string {
+    const start = text.indexOf(head);
+    assert.notEqual(start, -1, `${head} is declared`);
+    const end = text.indexOf("\n}", start);
+    assert.notEqual(end, -1);
+    return text.slice(start, end + 2);
+  }
+
+  /** The wiring rule: the body calls the strict parser and holds no regular expression. */
+  function wiringProblems(excerpt: string): string[] {
+    const problems: string[] = [];
+    if (!excerpt.includes("checkSelectedDatabase(")) problems.push("no checkSelectedDatabase call");
+    const tokens = tokenize(excerpt);
+    if (tokens.some((token) => token.kind === "regex")) problems.push("a regular-expression literal");
+    if (tokens.some((token) => token.kind === "identifier" && token.value === "RegExp")) problems.push("a RegExp construction");
+    return problems;
+  }
+
+  it("verifySelectedDatabase's body calls checkSelectedDatabase( and holds no regular expression", () => {
+    const excerpt = body(source, "async function verifySelectedDatabase(");
+    assert.deepEqual(wiringProblems(excerpt), []);
+  });
+
+  it("planted control: the same body with the call removed (the old regex restored) fails the check", () => {
+    const excerpt = body(source, "async function verifySelectedDatabase(");
+    const planted = excerpt.replace(
+      "checkSelectedDatabase(info, db);",
+      `const selected = /(?:^|\\s)db=([0-9]+)(?:\\s|$)/.exec(info)?.[1];\n  void selected;`,
+    );
+    assert.notEqual(planted, excerpt, "the plant changed the body");
+    assert.deepEqual(wiringProblems(planted).sort(), ["a regular-expression literal", "no checkSelectedDatabase call"]);
+  });
+
+  it("observeClientInfoShape returns only describeClientInfoShape's result and runs no deleting command", () => {
+    const excerpt = body(source, "export async function observeClientInfoShape(");
+    assert.match(excerpt, /return describeClientInfoShape\(reply\);/);
+    assert.equal((excerpt.match(/\breturn\b/g) ?? []).length, 1, "a single return path");
+    const scan = scanRedisAccess(GUARD_FILE, excerpt);
+    assert.deepEqual(scan.violations, []);
+    assert.deepEqual(scan.deletions, []);
+  });
+});
 
 describe("D-F2: no substitutable cleanup capability (the export surface)", () => {
   it("the design lists every module of the test support", async () => {

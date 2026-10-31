@@ -99,7 +99,14 @@ export interface RoleRecord {
   readonly replication: boolean;
   readonly bypassrls: boolean;
   readonly inherit: boolean;
+  /** Roles this role is a member of (direct). */
   readonly memberOf: string[];
+  /** Task 012B (Q2): `rolconnlimit` (-1 is no limit). */
+  readonly connectionLimit: number;
+  /** Task 012B (Q2): whether `rolvaliduntil` is set (the value is never read). */
+  readonly validUntilSet: boolean;
+  /** Task 012B (Q2): roles that are members of this role (direct; the other direction). */
+  readonly members: string[];
 }
 
 export async function readRole(client: PgClient, name: string): Promise<RoleRecord | undefined> {
@@ -112,11 +119,17 @@ export async function readRole(client: PgClient, name: string): Promise<RoleReco
     rolbypassrls: boolean;
     rolinherit: boolean;
     member_of: string[] | null;
+    rolconnlimit: number;
+    valid_until_set: boolean;
+    members: string[] | null;
   }>(
     `SELECT r.rolsuper, r.rolcanlogin, r.rolcreatedb, r.rolcreaterole, r.rolreplication,
             r.rolbypassrls, r.rolinherit,
             (SELECT array_agg(g.rolname ORDER BY g.rolname) FROM pg_catalog.pg_auth_members m
-               JOIN pg_catalog.pg_roles g ON g.oid = m.roleid WHERE m.member = r.oid) AS member_of
+               JOIN pg_catalog.pg_roles g ON g.oid = m.roleid WHERE m.member = r.oid) AS member_of,
+            r.rolconnlimit, (r.rolvaliduntil IS NOT NULL) AS valid_until_set,
+            (SELECT array_agg(u.rolname ORDER BY u.rolname) FROM pg_catalog.pg_auth_members m
+               JOIN pg_catalog.pg_roles u ON u.oid = m.member WHERE m.roleid = r.oid) AS members
        FROM pg_catalog.pg_roles r WHERE r.rolname = $1`,
     [name],
   );
@@ -132,7 +145,23 @@ export async function readRole(client: PgClient, name: string): Promise<RoleReco
     bypassrls: row.rolbypassrls,
     inherit: row.rolinherit,
     memberOf: row.member_of ?? [],
+    connectionLimit: row.rolconnlimit,
+    validUntilSet: row.valid_until_set,
+    members: row.members ?? [],
   };
+}
+
+/**
+ * Task 012B (Q2; F6): whether a role has a password, as a Boolean only. Admin
+ * mode only: `pg_authid` is readable by a superuser alone. The password column
+ * itself is never selected. Undefined when the role does not exist.
+ */
+export async function readPasswordPresence(admin: PgClient, name: string): Promise<boolean | undefined> {
+  const result = await admin.query<{ present: boolean }>(
+    `SELECT (a.rolpassword IS NOT NULL) AS present FROM pg_catalog.pg_authid a WHERE a.rolname = $1`,
+    [name],
+  );
+  return result.rows[0]?.present;
 }
 
 /** Every ACL entry on irs_test_meta and its sentinel table, as `grantee privilege`. */

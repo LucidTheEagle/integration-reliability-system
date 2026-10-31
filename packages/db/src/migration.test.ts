@@ -17,6 +17,14 @@ const MIGRATIONS = fileURLToPath(new URL("../../../prisma/migrations/", import.m
 const INIT_MIGRATION_SHA256 = "51aea0ee42fe50ebd31d04740fbad303dfa8aae03b387d938407817efb70f47b";
 /** migration_lock.toml's SHA-256 (R5 baseline). */
 const MIGRATION_LOCK_SHA256 = "99836963713b4f5b269ad49af0ed3d7b0b2e336115c2f92dc9ac683d139d0900";
+/**
+ * Task 012B (PL-2, B1-5 "preserved byte-identically"): the Task 011A
+ * migration's SHA-256, from run 3's E4 and 012B-2 RUN A's P7 (computed from
+ * the file before any change), never re-read from the file.
+ */
+const RATE_LIMIT_EVIDENCE_MIGRATION_SHA256 = "3af634e7bccdc45d4d159c7ec155fc5e9b7378f257b18d17b270f048dd313ea8";
+/** Task 012B (R6): the event_dispatch migration's SHA-256, captured when it was authored (012B-2 RUN A, A3). */
+const EVENT_DISPATCH_MIGRATION_SHA256 = "4e3bc4d8d5ad85fd841a9f12f481d0d2c9fa24a895fd85819f7e5ccd75dc51f2";
 
 function directories(): string[] {
   return readdirSync(MIGRATIONS, { withFileTypes: true })
@@ -95,6 +103,113 @@ describe("M1, tightened for Task 011A (RD-4)", () => {
   it("the init migration and migration_lock.toml are byte-identical to the baseline (SHA-256)", () => {
     assert.equal(sha256(`${MIGRATIONS}${initMigration().name}/migration.sql`), INIT_MIGRATION_SHA256);
     assert.equal(sha256(`${MIGRATIONS}migration_lock.toml`), MIGRATION_LOCK_SHA256);
+  });
+
+  it("Task 012B: the 011A migration is byte-identical too, and the event_dispatch migration equals its authored text (SHA-256)", () => {
+    assert.equal(sha256(`${MIGRATIONS}${rateLimitEvidenceMigration().name}/migration.sql`), RATE_LIMIT_EVIDENCE_MIGRATION_SHA256);
+    assert.equal(sha256(`${MIGRATIONS}${eventDispatchMigration().name}/migration.sql`), EVENT_DISPATCH_MIGRATION_SHA256);
+  });
+});
+
+function eventDispatchMigration(): { readonly name: string; readonly sql: string } {
+  const name = REQUIRED_MIGRATIONS.find((entry) => /^\d{14}_event_dispatch$/.test(entry)) ?? "";
+  assert.notEqual(name, "", "REQUIRED_MIGRATIONS names the Task 012B migration");
+  return { name, sql: readFileSync(`${MIGRATIONS}${name}/migration.sql`, "utf8") };
+}
+
+/** PL-1.2: the Prisma-generated part, as compared and pinned when authored (R6). */
+const EVENT_DISPATCH_GENERATED = [
+  `-- CreateEnum`,
+  `CREATE TYPE "DispatchAnomalyKind" AS ENUM ('COMPLETED_WHILE_QUEUED', 'FAILED_WHILE_QUEUED');`,
+  ``,
+  `-- AlterTable`,
+  `ALTER TABLE "Event" ADD COLUMN     "dispatchAnomalyAt" TIMESTAMPTZ(3),`,
+  `ADD COLUMN     "dispatchAnomalyKind" "DispatchAnomalyKind",`,
+  `ADD COLUMN     "lastPublishAckAt" TIMESTAMPTZ(3),`,
+  `ADD COLUMN     "lastPublishAttemptAt" TIMESTAMPTZ(3),`,
+  `ADD COLUMN     "publishAckedAt" TIMESTAMPTZ(3),`,
+  `ADD COLUMN     "publishAttemptCount" INTEGER NOT NULL DEFAULT 0,`,
+  `ADD COLUMN     "queuedAt" TIMESTAMPTZ(3),`,
+  `ADD COLUMN     "redispatchCount" INTEGER NOT NULL DEFAULT 0,`,
+  `ADD COLUMN     "redispatchRequestedAt" TIMESTAMPTZ(3);`,
+  ``,
+  `-- CreateIndex`,
+  `CREATE INDEX "Event_status_receivedAt_idx" ON "Event"("status", "receivedAt");`,
+  ``,
+  ``,
+].join("\n");
+
+/** PL-1.3, the four raw elements, verbatim (B1-2, B1-4, Q1, FD-7). */
+const EVENT_DISPATCH_CHECK = [
+  `ALTER TABLE "public"."Event" ADD CONSTRAINT "Event_dispatchAnomaly_consistency_check"`,
+  `  CHECK (("dispatchAnomalyAt" IS NULL) = ("dispatchAnomalyKind" IS NULL));`,
+].join("\n");
+const EVENT_DISPATCH_FUNCTION = [
+  `CREATE FUNCTION "public"."irs_event_dispatch_marker_guard"()`,
+  `  RETURNS trigger`,
+  `  LANGUAGE plpgsql`,
+  `  SECURITY INVOKER`,
+  `  SET search_path = pg_catalog, pg_temp`,
+  `AS $$`,
+  `BEGIN`,
+  `  IF TG_OP = 'INSERT' THEN`,
+  `    IF NEW."dispatchAnomalyAt" IS NOT NULL OR NEW."dispatchAnomalyKind" IS NOT NULL THEN`,
+  `      RAISE EXCEPTION 'irs dispatch marker rule T0' USING ERRCODE = 'IRST0';`,
+  `    END IF;`,
+  `    RETURN NEW;`,
+  `  END IF;`,
+  `  IF OLD."dispatchAnomalyAt" IS NOT NULL`,
+  `     AND (NEW."dispatchAnomalyAt" IS DISTINCT FROM OLD."dispatchAnomalyAt"`,
+  `          OR NEW."dispatchAnomalyKind" IS DISTINCT FROM OLD."dispatchAnomalyKind") THEN`,
+  `    RAISE EXCEPTION 'irs dispatch marker rule T2' USING ERRCODE = 'IRST2';`,
+  `  END IF;`,
+  `  IF OLD."dispatchAnomalyAt" IS NULL AND NEW."dispatchAnomalyAt" IS NOT NULL`,
+  `     AND NOT (OLD."status" = 'QUEUED'::"public"."EventState"`,
+  `              AND NEW."status" = 'QUEUED'::"public"."EventState"`,
+  `              AND NEW."dispatchAnomalyKind" IS NOT NULL) THEN`,
+  `    RAISE EXCEPTION 'irs dispatch marker rule T1' USING ERRCODE = 'IRST1';`,
+  `  END IF;`,
+  `  IF NEW."status" = 'PROCESSING'::"public"."EventState"`,
+  `     AND (OLD."dispatchAnomalyAt" IS NOT NULL OR NEW."dispatchAnomalyAt" IS NOT NULL) THEN`,
+  `    RAISE EXCEPTION 'irs dispatch marker rule T3' USING ERRCODE = 'IRST3';`,
+  `  END IF;`,
+  `  RETURN NEW;`,
+  `END`,
+  `$$;`,
+].join("\n");
+const EVENT_DISPATCH_REVOKE = `REVOKE ALL ON FUNCTION "public"."irs_event_dispatch_marker_guard"() FROM PUBLIC;`;
+const EVENT_DISPATCH_TRIGGER = [
+  `CREATE TRIGGER "irs_event_dispatch_marker_guard"`,
+  `  BEFORE INSERT OR UPDATE ON "public"."Event"`,
+  `  FOR EACH ROW EXECUTE FUNCTION "public"."irs_event_dispatch_marker_guard"();`,
+].join("\n");
+
+describe("M1: Task 012B event_dispatch migration content (PL-2)", () => {
+  it("begins with exactly PL-1.2's generated statements", () => {
+    assert.ok(eventDispatchMigration().sql.startsWith(EVENT_DISPATCH_GENERATED));
+  });
+
+  it("contains the CHECK, the function, the REVOKE and the trigger verbatim, in that order; the REVOKE between CREATE FUNCTION and CREATE TRIGGER", () => {
+    const { sql } = eventDispatchMigration();
+    const positions = [EVENT_DISPATCH_CHECK, EVENT_DISPATCH_FUNCTION, EVENT_DISPATCH_REVOKE, EVENT_DISPATCH_TRIGGER].map((element) => {
+      const at = sql.indexOf(element);
+      assert.notEqual(at, -1, element.split("\n")[0]);
+      return at;
+    });
+    assert.deepEqual([...positions].sort((a, b) => a - b), positions, "in PL-1.3's order");
+    assert.ok(sql.indexOf("CREATE FUNCTION") < sql.indexOf("REVOKE ALL ON FUNCTION"));
+    assert.ok(sql.indexOf("REVOKE ALL ON FUNCTION") < sql.indexOf("CREATE TRIGGER"));
+  });
+
+  it("names no role, grants nothing, installs no extension, alters no role, defines no SECURITY DEFINER function, and has no CR", () => {
+    const { sql } = eventDispatchMigration();
+    assert.doesNotMatch(sql, /\bGRANT\b/);
+    assert.doesNotMatch(sql, /OWNER TO/);
+    assert.doesNotMatch(sql, /irs_test/);
+    assert.doesNotMatch(sql, /CREATE EXTENSION/i);
+    assert.doesNotMatch(sql, /ALTER ROLE/i);
+    assert.doesNotMatch(sql, /SECURITY DEFINER/i);
+    assert.ok(!sql.includes("\r"));
   });
 });
 

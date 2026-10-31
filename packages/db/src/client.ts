@@ -61,8 +61,19 @@ export interface PgPoolConfig {
   readonly options: string;
 }
 
+/**
+ * Task 012B (R1, PL-8): the only session time zone a pool may pin. The worker
+ * pins every physical connection to UTC with a connection-start option, the
+ * same mechanism as `transaction_timeout`; without it the options are unchanged.
+ */
+export type SessionTimeZone = "UTC";
+
 /** @internal — exported for the settings tests; not part of the package API. */
-export function toPgPoolConfig(connectionString: string, settings: PoolSettings): PgPoolConfig {
+export function toPgPoolConfig(
+  connectionString: string,
+  settings: PoolSettings,
+  sessionTimeZone?: SessionTimeZone,
+): PgPoolConfig {
   return {
     connectionString,
     max: settings.maxConnections,
@@ -72,7 +83,8 @@ export function toPgPoolConfig(connectionString: string, settings: PoolSettings)
     idle_in_transaction_session_timeout: settings.idleInTransactionTimeoutMs,
     keepAlive: settings.keepAlive,
     keepAliveInitialDelayMillis: settings.keepAliveInitialDelayMs,
-    options: "-c transaction_timeout=0",
+    options:
+      sessionTimeZone === "UTC" ? "-c transaction_timeout=0 -c TimeZone=UTC" : "-c transaction_timeout=0",
   };
 }
 
@@ -90,12 +102,17 @@ export interface CreateDatabaseOptions {
   readonly pool?: Partial<PoolSettings>;
   /** Default `performance.now`. */
   readonly monotonicNow?: () => number;
+  /**
+   * Task 012B (R1): `"UTC"` pins every physical connection's `TimeZone` at
+   * connection start (the worker's composition). Absent: unchanged (the API).
+   */
+  readonly sessionTimeZone?: SessionTimeZone;
 }
 
 /** Builds the client and its pool. Performs no I/O: the pool connects lazily. */
 export function createDatabase(options: CreateDatabaseOptions): Database {
   const settings: PoolSettings = { ...DEFAULT_POOL_SETTINGS, ...options.pool };
-  const adapter = new PrismaPg({ ...toPgPoolConfig(options.connectionString, settings) });
+  const adapter = new PrismaPg({ ...toPgPoolConfig(options.connectionString, settings, options.sessionTimeZone) });
   const prisma = new PrismaClient({ adapter });
   return {
     prisma,

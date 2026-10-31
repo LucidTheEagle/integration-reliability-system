@@ -50,17 +50,49 @@ export const SPECIAL_ROLES: readonly SpecialRole[] = [
   },
 ];
 
+/** Task 012B (B1-7, B1-8): the dispatcher's test role. LOGIN NOINHERIT, no password. */
+export const WORKER_ROLE = "irs_test_worker";
+
+/** Task 012B (FD-1): the worker role's connection limit (sessions authenticating as it, all databases). */
+export const WORKER_CONNECTION_LIMIT = 16;
+
+/**
+ * Task 012B (Q2, PL-6.1): the attributes each registered role must have, checked
+ * in both directions. Every role is also NOSUPERUSER NOCREATEDB NOCREATEROLE
+ * NOREPLICATION NOBYPASSRLS, has no password and no expiry, is a member of no
+ * role, and has no member. The six Task 011 roles' values are the observed
+ * PostgreSQL defaults, made explicit.
+ */
+export interface RoleProfile {
+  readonly login: boolean;
+  readonly inherit: boolean;
+  readonly connectionLimit: number;
+}
+
 /** Roles created by bootstrap-main, in creation order. */
 export const BOOTSTRAP_ROLES: readonly { readonly name: string; readonly login: boolean }[] = [
   { name: API_ROLE, login: true },
   { name: LOCK_OWNER_ROLE, login: false },
   ...SPECIAL_ROLES.map((role) => ({ name: role.name, login: true })),
+  { name: WORKER_ROLE, login: true },
 ];
+
+/** The profile of every registered role (BOOTSTRAP_ROLES), by name. */
+export const ROLE_PROFILES: Readonly<Record<string, RoleProfile>> = Object.freeze({
+  [API_ROLE]: { login: true, inherit: true, connectionLimit: -1 },
+  [LOCK_OWNER_ROLE]: { login: false, inherit: true, connectionLimit: -1 },
+  ...Object.fromEntries(SPECIAL_ROLES.map((role) => [role.name, { login: true, inherit: true, connectionLimit: -1 }])),
+  [WORKER_ROLE]: { login: true, inherit: false, connectionLimit: WORKER_CONNECTION_LIMIT },
+});
+
+/** The only roles the incremental bootstrap step (bootstrap-roles) may create. */
+export const INCREMENTAL_ROLES: readonly string[] = [WORKER_ROLE];
 
 /** Roles holding USAGE on irs_test_meta and SELECT on its sentinel in irs_011_test. */
 export const MAIN_SENTINEL_ROLES: readonly string[] = [
   API_ROLE,
   ...SPECIAL_ROLES.filter((role) => role.sentinelPrivileges).map((role) => role.name),
+  WORKER_ROLE,
 ];
 
 export interface ScratchPurpose {
@@ -115,6 +147,22 @@ export const SCRATCH_PURPOSES: readonly ScratchPurpose[] = [
     purpose: "rle",
     description: "Task 011A RD-7: readiness against an altered RateLimitEvidence table, primary key and natural-key indexes",
     sentinelRoles: [API_ROLE],
+  },
+  // Task 012B (FD-6, PL-6.6): marked rows and dispatch audit rows never touch irs_011_test.
+  {
+    purpose: "dispatch",
+    description: "Task 012B: the dispatch-marker trigger matrix T0-T5, the CHECK, Q1 and the worker's permitted and refused operations",
+    sentinelRoles: [API_ROLE, WORKER_ROLE],
+  },
+  {
+    purpose: "dispatchtime",
+    description: "Task 012B: R1 (UTC-pinned worker sessions), the B1-1 backlog age and the B2-11 audit insert under a non-UTC session",
+    sentinelRoles: [API_ROLE, WORKER_ROLE],
+  },
+  {
+    purpose: "dispatchready",
+    description: "Task 012B: readiness against altered dispatch objects (trigger modes, CHECK, index, function, column type)",
+    sentinelRoles: [API_ROLE, WORKER_ROLE],
   },
 ];
 
@@ -187,6 +235,38 @@ const EVIDENCE_GRANTS: readonly GrantSpec[] = [
   ),
 ];
 
+/** Task 012B (B1-1, B1-2; ADD §3.3c): the nine dispatch columns of "Event". */
+export const DISPATCH_COLUMNS = [
+  "queuedAt",
+  "lastPublishAttemptAt",
+  "publishAttemptCount",
+  "publishAckedAt",
+  "lastPublishAckAt",
+  "redispatchRequestedAt",
+  "redispatchCount",
+  "dispatchAnomalyAt",
+  "dispatchAnomalyKind",
+] as const;
+
+/**
+ * Task 012B (B1-7, PL-5; B2-11 freezes the AuditEntry grant): SELECT on "Event"
+ * id, status, receivedAt and the nine dispatch columns; UPDATE on status and
+ * the nine dispatch columns; INSERT only on "AuditEntry" (no RETURNING, no ON
+ * CONFLICT); the three ledger columns for readiness. Nothing else: no payload,
+ * rawBody, metadata, integration or external identifier, no DELETE, TRUNCATE,
+ * EXECUTE or schema CREATE.
+ */
+const WORKER_GRANTS: readonly GrantSpec[] = [
+  ...(["id", "status", "receivedAt", ...DISPATCH_COLUMNS] as const).map(
+    (column): GrantSpec => ({ kind: "COLUMN", table: "Event", column, privilege: "SELECT" }),
+  ),
+  ...(["status", ...DISPATCH_COLUMNS] as const).map(
+    (column): GrantSpec => ({ kind: "COLUMN", table: "Event", column, privilege: "UPDATE" }),
+  ),
+  { kind: "TABLE", table: "AuditEntry", privilege: "INSERT" },
+  ...LEDGER_GRANTS,
+];
+
 export const APPLICATION_GRANTS: Readonly<Record<string, readonly GrantSpec[]>> = {
   [API_ROLE]: [...INGESTION_GRANTS, EXECUTE_GRANT, ...LEDGER_GRANTS, ...EVIDENCE_GRANTS],
   irs_test_api_no_ledger: [...INGESTION_GRANTS, EXECUTE_GRANT],
@@ -200,6 +280,7 @@ export const APPLICATION_GRANTS: Readonly<Record<string, readonly GrantSpec[]>> 
     { kind: "COLUMN", table: "Integration", column: "configStatus", privilege: "SELECT" },
     { kind: "COLUMN", table: "Integration", column: "updatedAt", privilege: "UPDATE" },
   ],
+  [WORKER_ROLE]: WORKER_GRANTS,
 };
 
 /** The catalog form of a grant, e.g. `COLUMN public.Event.id SELECT`. */

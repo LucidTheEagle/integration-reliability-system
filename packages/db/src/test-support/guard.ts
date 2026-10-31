@@ -5,11 +5,14 @@ import {
   API_ROLE,
   APPLICATION_GRANTS,
   MAIN_DATABASE,
+  MAIN_SENTINEL_ROLES,
+  ROLE_PROFILES,
   SENTINEL_MARKER,
   SHADOW_DATABASE,
   SPECIAL_ROLES,
   TEST_HOST,
   TEST_PORT,
+  WORKER_ROLE,
   grantKey,
   scratchPurposeOf,
 } from "./registry.js";
@@ -17,8 +20,11 @@ import {
 // The test-database guard (Prompt B §4.1–§4.2). Every test connection
 // (P3), bootstrap connection (P2) and Prisma CLI target (P4) goes through
 // it. A refusal names the failed check and never includes the URL.
+// Task 012B (B1-8, Q2): mode `worker` connects as irs_test_worker and also
+// checks its registered profile (NOINHERIT, connection limit, no expiry, no
+// member roles) and its exact grant set.
 
-export type GuardMode = "api" | "admin" | "special";
+export type GuardMode = "api" | "admin" | "special" | "worker";
 
 export class GuardRefusal extends Error {
   override readonly name = "GuardRefusal";
@@ -86,6 +92,8 @@ export function expectedUser(mode: GuardMode, special?: string): string {
       return ADMIN_ROLE;
     case "special":
       return specialRole(special).name;
+    case "worker":
+      return WORKER_ROLE;
   }
 }
 
@@ -168,6 +176,7 @@ export async function verifyPostConnect(
 
   if (expected.mode !== "admin") {
     await verifyUnprivilegedRole(client, expected.user);
+    if (expected.mode === "worker") await verifyWorkerProfile(client, expected.user);
     await verifySentinelPrivileges(client);
   }
 
@@ -192,6 +201,53 @@ export async function verifyPostConnect(
 
   if (expected.mode === "special") {
     await verifySpecialGrants(client, expected.user);
+  }
+  if (expected.mode === "worker") {
+    await verifyWorkerGrants(client, expected.user);
+  }
+}
+
+/**
+ * Task 012B (Q2, PL-6.2): the worker-mode profile check, read from the
+ * registry: login, NOINHERIT, the registered connection limit, no expiry, and
+ * no role that is a member of it (the other direction is verifyUnprivilegedRole's).
+ * Password presence is not readable here (F6): admin mode checks it.
+ */
+async function verifyWorkerProfile(client: PgClient, user: string): Promise<void> {
+  // The worker's registered profile, whatever user is connected (PL-6.2: NOINHERIT, FD-1's limit).
+  const profile = ROLE_PROFILES[WORKER_ROLE];
+  if (profile === undefined) throw new GuardRefusal("role-profile", `${WORKER_ROLE} has no registered profile`);
+  const row = (
+    await client.query<{ rolcanlogin: boolean; rolinherit: boolean; rolconnlimit: number; valid_until_set: boolean }>(
+      `SELECT rolcanlogin, rolinherit, rolconnlimit, (rolvaliduntil IS NOT NULL) AS valid_until_set
+         FROM pg_catalog.pg_roles WHERE rolname = $1`,
+      [user],
+    )
+  ).rows[0];
+  if (row === undefined) throw new GuardRefusal("role-profile", `role ${user} not found`);
+  if (
+    row.rolcanlogin !== profile.login ||
+    row.rolinherit !== profile.inherit ||
+    row.rolconnlimit !== profile.connectionLimit ||
+    row.valid_until_set !== false
+  ) {
+    throw new GuardRefusal("role-profile", `${user} does not match its registered profile`);
+  }
+  const members = await client.query(
+    `SELECT 1 FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+      WHERE r.rolname = $1`,
+    [user],
+  );
+  if (members.rows.length !== 0) {
+    throw new GuardRefusal("role-members", `another role is a member of ${user}`);
+  }
+}
+
+async function verifyWorkerGrants(client: PgClient, role: string): Promise<void> {
+  const held = await grantsHeldBy(client, role);
+  const expected = expectedGrantsInMain(WORKER_ROLE);
+  if (JSON.stringify(held) !== JSON.stringify(expected)) {
+    throw new GuardRefusal("worker-grants", `${role} does not hold exactly its registered grants`);
   }
 }
 
@@ -295,11 +351,10 @@ export async function grantsHeldBy(client: PgClient, role: string): Promise<stri
 /** The application grants the registry expects, plus the sentinel grants. */
 export function expectedGrantsInMain(role: string): string[] {
   const application = (APPLICATION_GRANTS[role] ?? []).map(grantKey);
-  const special = SPECIAL_ROLES.find((entry) => entry.name === role);
-  const sentinel =
-    role === API_ROLE || special?.sentinelPrivileges === true
-      ? ["SCHEMA irs_test_meta USAGE", "TABLE irs_test_meta.sentinel SELECT"]
-      : [];
+  // The API role, the special roles with sentinel privileges and (Task 012B) the worker.
+  const sentinel = MAIN_SENTINEL_ROLES.includes(role)
+    ? ["SCHEMA irs_test_meta USAGE", "TABLE irs_test_meta.sentinel SELECT"]
+    : [];
   return [...application, ...sentinel].sort();
 }
 
@@ -351,8 +406,11 @@ export async function openClient(url: string, applicationName: string): Promise<
   return client;
 }
 
+/** The test variables, by name only (Task 012B adds the worker's, B1-8). */
+export type TestUrlVariable = "IRS_TEST_DATABASE_URL" | "IRS_TEST_ADMIN_DATABASE_URL" | "IRS_TEST_WORKER_DATABASE_URL";
+
 /** Reads a required test variable; fails loudly, never skips. */
-export function requireTestUrl(name: "IRS_TEST_DATABASE_URL" | "IRS_TEST_ADMIN_DATABASE_URL"): string {
+export function requireTestUrl(name: TestUrlVariable): string {
   const value = process.env[name];
   if (value === undefined || value === "") {
     throw new GuardRefusal("environment", `${name} is not set; database tests cannot run`);

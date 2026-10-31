@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { DEFAULT_POOL_SETTINGS, toPgPoolConfig } from "./client.js";
+import { DEFAULT_POOL_SETTINGS, createDatabase, toPgPoolConfig } from "./client.js";
 import type { Database } from "./client.js";
 import { sqlStateOf } from "./errors.js";
 import { ingestEvent } from "./event-ingestion.js";
@@ -20,7 +20,7 @@ import { connectGuarded, requireTestUrl, withDatabase, withUser } from "./test-s
 import type { GuardMode, GuardedConnection } from "./test-support/guard.js";
 import { runPrismaCli } from "./test-support/prisma-cli.js";
 import { grantScratch, migrateScratch } from "./test-support/provision.js";
-import { API_ROLE, scratchDatabaseName } from "./test-support/registry.js";
+import { API_ROLE, WORKER_ROLE, scratchDatabaseName } from "./test-support/registry.js";
 
 // Schema readiness against PostgreSQL (Rev 1.7 §8.5, §16.1 RD-T*; Addendum
 // VPF-3b, VPF-6). Readiness runs as irs_test_api unless a special role is the
@@ -457,6 +457,115 @@ describe("RD-T6a–p: S1 against substitute idempotency indexes", () => {
       }
       assert.deepEqual(await readiness(apiScratchUrl), { ready: true }, "restored");
       assert.ok(readdirSync(MIGRATION_DIR).includes(INIT));
+    });
+  });
+});
+
+/**
+ * Task 012B (R1, PL-4): the worker's own pool, as 012B-3 composes it: a
+ * worker-mode guard check, then max 3 connections pinned to UTC at connection start.
+ */
+async function workerReadiness(url: string, options: { readonly pinned: boolean; readonly sessionOptions?: string }): Promise<SchemaReadiness> {
+  const check = await connectGuarded({ url, mode: "worker", applicationName: "irs-test-worker-readiness-check" });
+  await check.close();
+  if (options.sessionOptions === undefined) {
+    const db = createDatabase({ connectionString: url, pool: { maxConnections: 3 }, sessionTimeZone: options.pinned ? "UTC" : undefined });
+    try {
+      return await verifySchemaReadiness(db, "worker");
+    } finally {
+      await db.prisma.$disconnect();
+    }
+  }
+  // Test-only: a worker-role pool opened with another session option (never the production pool).
+  const prisma = new PrismaClient({
+    adapter: new PrismaPg({ ...toPgPoolConfig(url, { ...DEFAULT_POOL_SETTINGS, maxConnections: 3 }), options: options.sessionOptions }),
+  });
+  const db: Database = { prisma, monotonicNow: () => performance.now(), ping: async () => void (await prisma.$queryRaw`SELECT 1`) };
+  try {
+    const shown = (await prisma.$queryRaw<{ tz: string }[]>`SELECT current_setting('TimeZone') AS tz`)[0]?.tz;
+    process.stdout.write(`[S6.d] worker pool with ${options.sessionOptions}: session TimeZone = ${String(shown)}\n`);
+    return await verifySchemaReadiness(db, "worker");
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+describe("Task 012B (B1-6, PL-4): the api and worker profiles on irs_011_test", () => {
+  const workerUrl = requireTestUrl("IRS_TEST_WORKER_DATABASE_URL");
+
+  it("api as irs_test_api and worker as irs_test_worker (through the UTC-pinned worker pool) are both ready: true", async () => {
+    assert.deepEqual(await readiness(apiUrl), { ready: true });
+    assert.deepEqual(await workerReadiness(workerUrl, { pinned: true }), { ready: true });
+  });
+
+  it("a worker-role pool opened with a non-UTC session option fails closed with S6.d", async () => {
+    assert.deepEqual(
+      await workerReadiness(workerUrl, { pinned: false, sessionOptions: "-c transaction_timeout=0 -c TimeZone=America/New_York" }),
+      { ready: false, reason: "SESSION_INVARIANT", assertion: "S6.d" },
+    );
+  });
+
+  it("the worker holds no EXECUTE on the status function, yet its profile is ready (control for FD-4)", async () => {
+    const check = await connectGuarded({ url: workerUrl, mode: "worker", applicationName: "irs-test-worker-execute" });
+    try {
+      const row = (
+        await check.client.query<{ can_execute: boolean }>(
+          `SELECT has_function_privilege('public.irs_integration_config_status_for_share(uuid)', 'EXECUTE') AS can_execute`,
+        )
+      ).rows[0];
+      assert.equal(row?.can_execute, false);
+    } finally {
+      await check.close();
+    }
+  });
+});
+
+describe("Task 012B (B1-6, PL-4): readiness against altered dispatch objects (dispatchready)", () => {
+  it("each out-of-band alteration fails closed with its own assertion; ENABLE ALWAYS passes; the structure is restored between cases", async () => {
+    await withScratch("dispatchready", async (scratch, apiScratchUrl, adminScratchUrl) => {
+      await migrateScratch(adminScratchUrl, [API_ROLE, WORKER_ROLE]);
+      assert.deepEqual(await readiness(apiScratchUrl), { ready: true }, "positive before any alteration");
+      const event = `"public"."Event"`;
+      const trigger = `"irs_event_dispatch_marker_guard"`;
+      const name = REQUIRED_MIGRATIONS.find((entry) => entry.endsWith("_event_dispatch")) ?? "";
+      const migration = readFileSync(join(MIGRATION_DIR, name, "migration.sql"), "utf8");
+      const createFunction = migration.slice(migration.indexOf("CREATE FUNCTION"), migration.indexOf("$$;") + 3);
+      assert.ok(createFunction.startsWith("CREATE FUNCTION") && createFunction.endsWith("$$;"), "the migration's CREATE FUNCTION");
+      const restoreFunction = createFunction.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION");
+      const cases: [string, string[], string[]][] = [
+        ["DISPATCH.trigger_enabled", [`ALTER TABLE ${event} DISABLE TRIGGER ${trigger}`], [`ALTER TABLE ${event} ENABLE TRIGGER ${trigger}`]],
+        ["DISPATCH.trigger_enabled", [`ALTER TABLE ${event} ENABLE REPLICA TRIGGER ${trigger}`], [`ALTER TABLE ${event} ENABLE TRIGGER ${trigger}`]],
+        ["DISPATCH.check", [`ALTER TABLE ${event} DROP CONSTRAINT "Event_dispatchAnomaly_consistency_check"`], [
+          `ALTER TABLE ${event} ADD CONSTRAINT "Event_dispatchAnomaly_consistency_check" CHECK (("dispatchAnomalyAt" IS NULL) = ("dispatchAnomalyKind" IS NULL))`,
+        ]],
+        ["DISPATCH.index", [`DROP INDEX "public"."Event_status_receivedAt_idx"`], [
+          `CREATE INDEX "Event_status_receivedAt_idx" ON ${event}("status", "receivedAt")`,
+        ]],
+        ["DISPATCH.function", [restoreFunction.replace("  RETURN NEW;\nEND", "  RETURN NEW;\n  -- altered\nEND")], [restoreFunction]],
+        ["DISPATCH.columns", [`ALTER TABLE ${event} ALTER COLUMN "queuedAt" TYPE timestamp(3)`], [`ALTER TABLE ${event} ALTER COLUMN "queuedAt" TYPE timestamptz(3)`]],
+      ];
+      for (const [assertion, alter, restore] of cases) {
+        // Admin mode, scratch only: an out-of-band alteration, restored below.
+        for (const statement of alter) await scratch.client.query(statement);
+        try {
+          assert.deepEqual(await readiness(apiScratchUrl), STRUCTURE(assertion), alter.join("; "));
+        } finally {
+          for (const statement of restore) await scratch.client.query(statement);
+        }
+        assert.deepEqual(await readiness(apiScratchUrl), { ready: true }, `restored after: ${alter.join("; ")}`);
+      }
+      await scratch.client.query(`ALTER TABLE ${event} ENABLE ALWAYS TRIGGER ${trigger}`);
+      try {
+        assert.deepEqual(await readiness(apiScratchUrl), { ready: true }, "ENABLE ALWAYS (A) passes");
+      } finally {
+        await scratch.client.query(`ALTER TABLE ${event} ENABLE TRIGGER ${trigger}`);
+      }
+      const mode = (
+        await scratch.client.query<{ tgenabled: string }>(
+          `SELECT tgenabled::text AS tgenabled FROM pg_catalog.pg_trigger WHERE tgname = 'irs_event_dispatch_marker_guard'`,
+        )
+      ).rows;
+      assert.deepEqual(mode, [{ tgenabled: "O" }], "restored to origin-enabled");
     });
   });
 });

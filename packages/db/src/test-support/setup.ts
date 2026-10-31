@@ -1,6 +1,6 @@
 import { mkdirSync, existsSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { bootstrapMain, bootstrapShadow } from "./bootstrap.js";
+import { bootstrapMain, bootstrapRoles, bootstrapShadow } from "./bootstrap.js";
 import { collectEvidence } from "./evidence.js";
 import { connectGuarded, requireTestUrl, withDatabase } from "./guard.js";
 import { REPO_ROOT, runPrismaCli } from "./prisma-cli.js";
@@ -9,6 +9,7 @@ import { SHADOW_DATABASE } from "./registry.js";
 
 // Test-database setup CLI (run by hand, never by tests):
 //   node dist/test-support/setup.js bootstrap
+//   node dist/test-support/setup.js bootstrap-roles   (Task 012B: the incremental role step; then provision)
 //   node dist/test-support/setup.js author prisma/migrations/<dir>/migration.sql
 //   node dist/test-support/setup.js author-next prisma/migrations/<dir>/migration.sql
 //   node dist/test-support/setup.js provision
@@ -103,6 +104,11 @@ async function main(): Promise<void> {
   switch (command) {
     case "bootstrap":
       return bootstrap();
+    case "bootstrap-roles": {
+      const evidence = await bootstrapRoles(requireTestUrl("IRS_TEST_ADMIN_DATABASE_URL"));
+      for (const line of evidence) process.stdout.write(`[bootstrap-roles] ${line}\n`);
+      return;
+    }
     case "author":
       return author(argument);
     case "author-next":
@@ -116,7 +122,7 @@ async function main(): Promise<void> {
       process.stdout.write(`${await collectEvidence(requireTestUrl("IRS_TEST_ADMIN_DATABASE_URL"))}\n`);
       return;
     default:
-      throw new Error("usage: setup.js bootstrap | author <path> | author-next <path> | provision | evidence");
+      throw new Error("usage: setup.js bootstrap | bootstrap-roles | author <path> | author-next <path> | provision | evidence");
   }
 }
 

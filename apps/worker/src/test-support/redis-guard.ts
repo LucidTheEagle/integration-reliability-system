@@ -63,7 +63,13 @@ export type RedisGuardCheck =
   | "inherited-endpoint"
   | "sentinel-missing"
   | "sentinel-mismatch"
-  | "guard-check-scope";
+  | "guard-check-scope"
+  // Task 012B (Q4, PL-11): the CLIENT INFO `db=` parser's refusals.
+  | "database-expected"
+  | "database-reply"
+  | "database-field"
+  | "database-value"
+  | "database-mismatch";
 
 export class RedisGuardRefusal extends Error {
   override readonly name = "RedisGuardRefusal";
@@ -386,11 +392,110 @@ export function checkGuardCheckScope(db: number, key: string): void {
   }
 }
 
+/** Q4: canonical non-negative decimal, at most nine digits (so no overflow). */
+const CANONICAL_DATABASE_NUMBER = /^(0|[1-9][0-9]{0,8})$/;
+
+/**
+ * Task 012B (Q4, PL-11; B1-12 carry-forward 1): the strict, pure parser of a
+ * CLIENT INFO reply's `db=` field. One line, with at most one trailing "\n";
+ * tokens separated by single spaces, each `key=value` with a non-empty key;
+ * exactly one token whose key is exactly `db`; its value in canonical decimal;
+ * equal to `expected`, itself a registered logical database. Anything
+ * malformed or ambiguous fails closed: no fallback to a first occurrence and no
+ * other source for the number. Throws RedisGuardRefusal; never echoes a value.
+ */
+export function checkSelectedDatabase(clientInfo: string, expected: number): void {
+  if (!REGISTERED_DATABASE_INDEXES.includes(expected)) {
+    throw new RedisGuardRefusal("database-expected", "the expected logical database is not registered");
+  }
+  const line = clientInfo.endsWith("\n") ? clientInfo.slice(0, -1) : clientInfo;
+  if (line === "" || line.includes("\n") || line.includes("\r")) {
+    throw new RedisGuardRefusal("database-reply", "the CLIENT INFO reply is not exactly one line");
+  }
+  const tokens = line.split(" ");
+  if (tokens.some((token) => token.indexOf("=") <= 0)) {
+    throw new RedisGuardRefusal("database-reply", "the CLIENT INFO reply is not single-space key=value tokens");
+  }
+  const values = tokens.filter((token) => token.slice(0, token.indexOf("=")) === "db").map((token) => token.slice("db=".length));
+  if (values.length !== 1) {
+    throw new RedisGuardRefusal("database-field", "the CLIENT INFO reply does not hold exactly one db field");
+  }
+  const value = values[0] ?? "";
+  if (!CANONICAL_DATABASE_NUMBER.test(value)) {
+    throw new RedisGuardRefusal("database-value", "the db field is not a canonical decimal number");
+  }
+  if (Number(value) !== expected) {
+    throw new RedisGuardRefusal("database-mismatch", "the connection is not on the expected logical database");
+  }
+}
+
 async function verifySelectedDatabase(client: Redis, db: number): Promise<void> {
   const info = await command(() => client.client("INFO"));
-  const selected = /(?:^|\s)db=([0-9]+)(?:\s|$)/.exec(info)?.[1];
-  if (selected === undefined || Number(selected) !== db) {
-    throw new RedisGuardRefusal("database", "the connection is not on the expected logical database");
+  checkSelectedDatabase(info, db);
+}
+
+/**
+ * Task 012B (Part B5 decision 3; Part B4's carry-forward for RUN B): the
+ * shape of a CLIENT INFO reply, with no value but the `db` field's. Key names
+ * are listed only when they are plain names (lower-case letters, digits and
+ * hyphens, at most 32), so a malformed token can never leak a value fragment.
+ */
+export interface ClientInfoShape {
+  readonly lineCount: number;
+  readonly endsWithSingleNewline: boolean;
+  readonly tokenCount: number;
+  readonly allTokensKeyValue: boolean;
+  readonly keyNames: readonly string[];
+  readonly dbTokenCount: number;
+  /** The `db` value, only when exactly one `db` token exists; otherwise null. */
+  readonly dbValue: string | null;
+  /** checkSelectedDatabase(reply, the guard-check database): "accepted" or the refusal code. */
+  readonly verdict: "accepted" | RedisGuardCheck;
+}
+
+const PLAIN_KEY_NAME = /^[a-z][a-z0-9-]{0,31}$/;
+
+/** Pure and string-only: no client, no connection. Returns only the fields of ClientInfoShape. */
+export function describeClientInfoShape(reply: string): ClientInfoShape {
+  const endsWithSingleNewline = reply.endsWith("\n") && !reply.endsWith("\n\n");
+  const body = reply.endsWith("\n") ? reply.slice(0, -1) : reply;
+  const tokens = body.split(" ");
+  const keyOf = (token: string): string | undefined => (token.indexOf("=") > 0 ? token.slice(0, token.indexOf("=")) : undefined);
+  const dbTokens = tokens.filter((token) => keyOf(token) === "db");
+  let verdict: "accepted" | RedisGuardCheck = "accepted";
+  try {
+    checkSelectedDatabase(reply, GUARD_CHECK_DATABASE_INDEX);
+  } catch (error) {
+    if (!(error instanceof RedisGuardRefusal)) throw error;
+    verdict = error.check;
+  }
+  return Object.freeze({
+    lineCount: body.split("\n").length,
+    endsWithSingleNewline,
+    tokenCount: tokens.length,
+    allTokensKeyValue: tokens.every((token) => keyOf(token) !== undefined) && !body.includes("\n") && !body.includes("\r"),
+    keyNames: Object.freeze(tokens.map(keyOf).filter((key): key is string => key !== undefined && PLAIN_KEY_NAME.test(key))),
+    dbTokenCount: dbTokens.length,
+    dbValue: dbTokens.length === 1 ? (dbTokens[0] ?? "").slice("db=".length) : null,
+    verdict,
+  });
+}
+
+/**
+ * Task 012B (RUN B, B1): read-only observation of the live reply's shape. The
+ * guarded path (endpoint, password file, sentinel), then the guard-check
+ * database, then CLIENT INFO, returned only through describeClientInfoShape.
+ * The strict check is not run first, so a non-conforming reply is still observed.
+ */
+export async function observeClientInfoShape(): Promise<ClientInfoShape> {
+  checkGuardCheckScope(GUARD_CHECK_DATABASE_INDEX, SENTINEL_KEY);
+  const guarded = await connectGuarded(REGISTERED_TARGET);
+  try {
+    await command(() => guarded.client.select(GUARD_CHECK_DATABASE_INDEX));
+    const reply = await command(() => guarded.client.client("INFO"));
+    return describeClientInfoShape(reply);
+  } finally {
+    await guarded.close();
   }
 }
 

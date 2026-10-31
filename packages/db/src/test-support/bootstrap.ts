@@ -1,5 +1,5 @@
 import { readServerBaseline } from "./baseline.js";
-import { openClient, validateTarget, verifyPostConnect, withDatabase } from "./guard.js";
+import { connectGuarded, grantsHeldBy, openClient, validateTarget, verifyPostConnect, withDatabase } from "./guard.js";
 import type { GuardedConnection } from "./guard.js";
 import {
   emptinessProblems,
@@ -11,11 +11,14 @@ import {
   sentinelAcl,
 } from "./inspect.js";
 import type { PgClient } from "./pg.js";
+import { expectedGrantsOf, roleProfileProblemsOf } from "./provision.js";
 import {
   ADMIN_ROLE,
   BOOTSTRAP_ROLES,
+  INCREMENTAL_ROLES,
   MAIN_DATABASE,
   MAIN_SENTINEL_ROLES,
+  ROLE_PROFILES,
   SENTINEL_MARKER,
   SHADOW_DATABASE,
   scratchDatabaseName,
@@ -127,8 +130,18 @@ async function sentinelProblems(
   return problems;
 }
 
-function roleStatement(name: string, login: boolean): string {
-  return `CREATE ROLE "${name}" ${login ? "LOGIN" : "NOLOGIN"} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`;
+/**
+ * Task 012B (PL-6.1): the CREATE ROLE statement from the role's registered
+ * profile, with INHERIT/NOINHERIT and CONNECTION LIMIT written explicitly. For
+ * the Task 011 roles these equal PostgreSQL's defaults. No PASSWORD, no VALID UNTIL.
+ */
+export function roleStatement(name: string): string {
+  const profile = ROLE_PROFILES[name];
+  if (profile === undefined) throw new BootstrapStop("role-profile", [`${name} has no registered profile`]);
+  return (
+    `CREATE ROLE "${name}" ${profile.login ? "LOGIN" : "NOLOGIN"} ${profile.inherit ? "INHERIT" : "NOINHERIT"} ` +
+    `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT ${profile.connectionLimit}`
+  );
 }
 
 export interface BootstrapMainResult {
@@ -155,7 +168,7 @@ export async function bootstrapMain(adminUrl: string): Promise<BootstrapMainResu
         client,
         MAIN_DATABASE,
         MAIN_SENTINEL_ROLES,
-        BOOTSTRAP_ROLES.map((role) => roleStatement(role.name, role.login)),
+        BOOTSTRAP_ROLES.map((role) => roleStatement(role.name)),
       );
     } catch (error) {
       throw new BootstrapStop("create", [
@@ -189,6 +202,118 @@ export async function bootstrapMain(adminUrl: string): Promise<BootstrapMainResu
   } catch (error) {
     await client.end().catch(() => undefined);
     throw error;
+  }
+}
+
+const EXPECTED_MAIN_CLUSTER_DATABASES = [MAIN_DATABASE, SHADOW_DATABASE, "postgres", "template0", "template1"].sort();
+const SENTINEL_PAIR = ["SCHEMA irs_test_meta USAGE", "TABLE irs_test_meta.sentinel SELECT"];
+
+/** One existing registered role: its profile in both directions, then its grants. */
+async function existingRoleProblems(admin: PgClient, name: string): Promise<string[]> {
+  const problems = await roleProfileProblemsOf(admin, name);
+  const held = await grantsHeldBy(admin, name);
+  const expected = expectedGrantsOf(name);
+  const exact = JSON.stringify(held) === JSON.stringify(expected);
+  // An incremental role that exists before its grants are provisioned may hold the sentinel pair only.
+  const sentinelOnly = INCREMENTAL_ROLES.includes(name) && JSON.stringify(held) === JSON.stringify([...SENTINEL_PAIR].sort());
+  if (!exact && !sentinelOnly) problems.push(`${name}: grants ${JSON.stringify(held)} expected ${JSON.stringify(expected)}`);
+  return problems;
+}
+
+/**
+ * Task 012B (B1-8, PL-6.3): bootstrap-roles, the guarded incremental step on
+ * the existing test cluster. It creates only a missing role named in
+ * INCREMENTAL_ROLES, with its registered profile and the two sentinel grants,
+ * and never alters, drops or revokes anything. Any unexpected state is a
+ * BootstrapStop before any change. Idempotent: a present, matching role is
+ * reported and nothing changes.
+ */
+export async function bootstrapRoles(adminUrl: string): Promise<string[]> {
+  const target = validateTarget(adminUrl, "admin");
+  if (target.database !== MAIN_DATABASE) {
+    throw new BootstrapStop("target", [`bootstrap-roles accepts only the admin URL of ${MAIN_DATABASE}`]);
+  }
+  const evidence: string[] = [];
+  const admin = await connectGuarded({ url: adminUrl, mode: "admin", applicationName: "irs-test-bootstrap-roles" });
+  try {
+    const c = admin.client;
+    evidence.push(`guard passed in admin mode: ${target.database} as ${target.user} (structure, sentinel)`);
+    const baseline = await readServerBaseline(c);
+    if (baseline.roleSettings !== 0 || baseline.autoConfEntries !== 0) {
+      throw new BootstrapStop("baseline", [
+        `${baseline.roleSettings} pg_db_role_setting rows`,
+        `${baseline.autoConfEntries} postgresql.auto.conf entries`,
+      ]);
+    }
+
+    // Preconditions, in a read-only transaction.
+    const registered = [ADMIN_ROLE, ...BOOTSTRAP_ROLES.map((role) => role.name)];
+    let absent: string[] = [];
+    await c.query("BEGIN READ ONLY");
+    try {
+      const problems: string[] = [];
+      const readOnly = (await c.query<{ transaction_read_only: string }>("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
+      if (readOnly !== "on") problems.push(`transaction_read_only ${readOnly ?? "?"}`);
+      const databases = await listDatabases(c);
+      if (JSON.stringify(databases) !== JSON.stringify(EXPECTED_MAIN_CLUSTER_DATABASES)) {
+        problems.push(`databases: ${databases.join(", ")}`);
+      }
+      const roles = await listRoles(c);
+      const unregistered = roles.filter((role) => !registered.includes(role));
+      if (unregistered.length !== 0) problems.push(`unregistered roles: ${unregistered.join(", ")}`);
+      absent = registered.filter((role) => !roles.includes(role));
+      const notIncremental = absent.filter((role) => !INCREMENTAL_ROLES.includes(role));
+      if (notIncremental.length !== 0) problems.push(`missing roles that bootstrap-roles may not create: ${notIncremental.join(", ")}`);
+      for (const role of BOOTSTRAP_ROLES.map((entry) => entry.name).filter((name) => roles.includes(name))) {
+        problems.push(...(await existingRoleProblems(c, role)));
+      }
+      const readers = MAIN_SENTINEL_ROLES.filter((role) => roles.includes(role));
+      const acl = await sentinelAcl(c);
+      if (JSON.stringify(acl) !== JSON.stringify(expectedSentinelAcl(readers))) {
+        problems.push(`sentinel ACL ${JSON.stringify(acl)} != expected ${JSON.stringify(expectedSentinelAcl(readers))}`);
+      }
+      if (problems.length > 0) throw new BootstrapStop("preconditions", problems);
+    } finally {
+      await c.query("COMMIT");
+    }
+    evidence.push("preconditions: databases, registered roles, every existing role's profile and grants, sentinel ACL (read-only)");
+
+    if (absent.length === 0) {
+      evidence.push(`present, verified: ${INCREMENTAL_ROLES.join(", ")}; nothing changed`);
+    } else {
+      await c.query("BEGIN");
+      try {
+        for (const role of absent) {
+          await c.query(roleStatement(role));
+          if (MAIN_SENTINEL_ROLES.includes(role)) {
+            await c.query(`GRANT USAGE ON SCHEMA "irs_test_meta" TO "${role}"`);
+            await c.query(`GRANT SELECT ON TABLE "irs_test_meta"."sentinel" TO "${role}"`);
+          }
+        }
+        await c.query("COMMIT");
+      } catch (error) {
+        await c.query("ROLLBACK").catch(() => undefined);
+        throw new BootstrapStop("create", [
+          `transaction failed and was rolled back: ${error instanceof Error ? error.message : "unknown"}`,
+        ]);
+      }
+      evidence.push(`created ${absent.join(", ")} with the registered profile and the sentinel grants; no password`);
+    }
+
+    // Re-verification.
+    const after: string[] = [];
+    for (const role of INCREMENTAL_ROLES) after.push(...(await existingRoleProblems(c, role)));
+    const acl = await sentinelAcl(c);
+    if (JSON.stringify(acl) !== JSON.stringify(expectedSentinelAcl(MAIN_SENTINEL_ROLES))) {
+      after.push(`sentinel ACL ${JSON.stringify(acl)}`);
+    }
+    const roles = await listRoles(c);
+    if (JSON.stringify(roles) !== JSON.stringify([...registered].sort())) after.push(`roles: ${roles.join(", ")}`);
+    if (after.length > 0) throw new BootstrapStop("re-verify", after);
+    evidence.push("re-verified: profile in both directions, password absent, sentinel ACL, role list equal to the registry");
+    return evidence;
+  } finally {
+    await admin.close();
   }
 }
 

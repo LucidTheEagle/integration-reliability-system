@@ -46,7 +46,17 @@ export { ingestEvent, sha256Hex } from "./event-ingestion.js";
 export type { EventIngestionInput, EventIngestionResult, IneligibleConfigStatus } from "./event-ingestion.js";
 
 export { REQUIRED_MIGRATIONS, verifySchemaReadiness } from "./schema-readiness.js";
-export type { SchemaReadiness, SessionAssertion, StructureAssertion } from "./schema-readiness.js";
+export type { ReadinessProfile, SchemaReadiness, SessionAssertion, StructureAssertion } from "./schema-readiness.js";
+
+// Task 012B (B2-11, FD-5): the dispatcher's audit insert; its callers are 012B-3/012B-4's.
+export { insertDispatchAuditEntry } from "./dispatch-audit.js";
+export type {
+  DispatchAuditAction,
+  DispatchAuditEntryInput,
+  DispatchAuditJson,
+  DispatchAuditMetadata,
+  DispatchAuditRefusalCode,
+} from "./dispatch-audit.js";
 
 export {
   MAX_LOCKED_TRANSACTION_WINDOW_MS,

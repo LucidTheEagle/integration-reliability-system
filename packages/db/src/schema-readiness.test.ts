@@ -3,12 +3,24 @@ import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  DISPATCH_CHECK_DEFINITION,
+  DISPATCH_COLUMNS,
+  DISPATCH_FUNCTION_BODY,
+  DISPATCH_INDEX_DEFINITION,
+  DISPATCH_TRIGGER_TYPE,
   RATE_LIMIT_EVIDENCE_INDEXES,
   REQUIRED_MIGRATIONS,
   STATUS_FUNCTION_BODY,
   evaluateReadiness,
 } from "./schema-readiness.js";
-import type { ReadinessObservations, ReadinessQueryId } from "./schema-readiness.js";
+import type {
+  ReadinessObservations,
+  ReadinessProfile,
+  ReadinessQueryId,
+  SchemaReadiness,
+  SessionAssertion,
+  StructureAssertion,
+} from "./schema-readiness.js";
 
 // Readiness evaluation without a database: injected catalog rows (RD-T6l′,
 // RD-T6p, RD-T7, RD-T8a, RD-T8d and one defect per assertion).
@@ -161,8 +173,47 @@ function good(): Map<ReadinessQueryId, readonly Row[]> {
     ["RLE.table", [{ table_exists: true }]],
     ["RLE.pk", [{ pk_columns: ["id"] }]],
     ["RLE.indexes", RLE_INDEXES],
+    // Task 012B (PL-4): the intact dispatch observations, and a UTC session.
+    ["DISPATCH.columns", DISPATCH_COLUMNS.map((column) => ({ ...column }))],
+    ["DISPATCH.enum", [{ label: "COMPLETED_WHILE_QUEUED" }, { label: "FAILED_WHILE_QUEUED" }]],
+    ["DISPATCH.index", [DISPATCH_INDEX_ROW]],
+    ["DISPATCH.check", [{ contype: "c", def: DISPATCH_CHECK_DEFINITION, convalidated: true }]],
+    ["DISPATCH.function", [DISPATCH_FUNCTION_ROW]],
+    ["DISPATCH.trigger", [DISPATCH_TRIGGER_ROW]],
+    ["S6.d", [{ tz: "UTC" }]],
   ]);
 }
+
+const DISPATCH_FUNCTION_OID = "16500";
+const DISPATCH_INDEX_ROW: Row = {
+  index_name: "Event_status_receivedAt_idx",
+  indexdef: DISPATCH_INDEX_DEFINITION,
+  indisunique: false,
+  indisvalid: true,
+  indisready: true,
+  indislive: true,
+  indimmediate: true,
+};
+const DISPATCH_FUNCTION_ROW: Row = {
+  oid: DISPATCH_FUNCTION_OID,
+  nargs: 0,
+  returns_trigger: true,
+  proretset: false,
+  prosecdef: false,
+  provolatile: "v",
+  proconfig: ["search_path=pg_catalog, pg_temp"],
+  prosrc: DISPATCH_FUNCTION_BODY,
+  lanname: "plpgsql",
+};
+const DISPATCH_TRIGGER_ROW: Row = {
+  tgfoid: DISPATCH_FUNCTION_OID,
+  tgtype: DISPATCH_TRIGGER_TYPE,
+  tgenabled: "O",
+  tgisinternal: false,
+  nargs: 0,
+  no_columns: true,
+  no_when: true,
+};
 
 function withRows(id: ReadinessQueryId, rows: readonly Row[] | undefined): ReadinessObservations {
   const map = good();
@@ -391,6 +442,228 @@ describe("RD-7 (Task 011A): RateLimitEvidence table, primary key and natural-key
     });
     assert.deepEqual(evaluateReadiness(noRle(withRows("L2", []))), { ready: false, reason: "MIGRATION_MISSING" });
     assert.deepEqual(evaluateReadiness(noRle(good())), structure("RLE.table"));
+  });
+});
+
+describe("Task 012B (B1-6, PL-4): the dispatch objects, the profiles and S6.d", () => {
+  const structure = (assertion: string) => ({ ready: false, reason: "STRUCTURE_MISMATCH", assertion });
+  const evaluate = (observations: ReadinessObservations, profile: ReadinessProfile = "api") =>
+    evaluateReadiness(observations, REQUIRED_MIGRATIONS, profile);
+
+  it("the intact observations are ready under both profiles", () => {
+    assert.deepEqual(evaluate(good(), "api"), { ready: true });
+    assert.deepEqual(evaluate(good(), "worker"), { ready: true });
+    assert.deepEqual(evaluateReadiness(good()), { ready: true }, "the default profile is api");
+  });
+
+  it("DISPATCH.columns: a missing column, a timestamp without time zone, a nullable counter, a missing or wrong default, an unreadable observation", () => {
+    const columns = good().get("DISPATCH.columns") ?? [];
+    const patch = (name: string, change: Row) => columns.map((row) => (row.column_name === name ? { ...row, ...change } : row));
+    const defects: [string, readonly Row[] | undefined][] = [
+      ["missing queuedAt", columns.filter((row) => row.column_name !== "queuedAt")],
+      ["timestamp without time zone", patch("queuedAt", { type: "timestamp(3) without time zone" })],
+      ["timestamptz(6)", patch("publishAckedAt", { type: "timestamp(6) with time zone" })],
+      ["nullable counter", patch("publishAttemptCount", { notnull: false })],
+      ["missing default", patch("redispatchCount", { column_default: null })],
+      ["wrong default", patch("redispatchCount", { column_default: "1" })],
+      ["NOT NULL timestamp", patch("dispatchAnomalyAt", { notnull: true })],
+      ["text kind", patch("dispatchAnomalyKind", { type: "text" })],
+      ["a duplicated row", [...columns, columns[0] ?? {}]],
+      ["unreadable", undefined],
+    ];
+    for (const [label, rows] of defects) assert.deepEqual(evaluate(withRows("DISPATCH.columns", rows)), structure("DISPATCH.columns"), label);
+    assert.deepEqual(evaluate(withRows("DISPATCH.columns", [...columns].reverse())), { ready: true }, "row order is irrelevant");
+  });
+
+  it("DISPATCH.enum: a missing, extra or reordered label, or an unreadable observation", () => {
+    for (const rows of [
+      [{ label: "COMPLETED_WHILE_QUEUED" }],
+      [{ label: "COMPLETED_WHILE_QUEUED" }, { label: "FAILED_WHILE_QUEUED" }, { label: "OTHER" }],
+      [{ label: "FAILED_WHILE_QUEUED" }, { label: "COMPLETED_WHILE_QUEUED" }],
+      [],
+      undefined,
+    ]) {
+      assert.deepEqual(evaluate(withRows("DISPATCH.enum", rows)), structure("DISPATCH.enum"), JSON.stringify(rows));
+    }
+  });
+
+  it("DISPATCH.index: missing, wrong text, unique, each usability flag false, duplicated, unreadable", () => {
+    const fail = structure("DISPATCH.index");
+    assert.deepEqual(evaluate(withRows("DISPATCH.index", [])), fail, "missing");
+    assert.deepEqual(evaluate(withRows("DISPATCH.index", undefined)), fail, "unreadable");
+    assert.deepEqual(evaluate(withRows("DISPATCH.index", [DISPATCH_INDEX_ROW, DISPATCH_INDEX_ROW])), fail, "two rows");
+    for (const patch of [
+      { indexdef: `${DISPATCH_INDEX_DEFINITION} ` },
+      { indexdef: "CREATE INDEX \"Event_status_receivedAt_idx\" ON public.\"Event\" USING btree (\"receivedAt\", status)" },
+      { indisunique: true },
+      { indisvalid: false },
+      { indisready: false },
+      { indislive: false },
+      { indimmediate: false },
+    ]) {
+      assert.deepEqual(evaluate(patchRow("DISPATCH.index", 0, patch)), fail, JSON.stringify(patch));
+    }
+  });
+
+  it("DISPATCH.check: missing, altered, not validated, another constraint type, unreadable", () => {
+    const fail = structure("DISPATCH.check");
+    assert.deepEqual(evaluate(withRows("DISPATCH.check", [])), fail);
+    assert.deepEqual(evaluate(withRows("DISPATCH.check", undefined)), fail);
+    for (const patch of [{ def: `${DISPATCH_CHECK_DEFINITION} ` }, { convalidated: false }, { contype: "f" }]) {
+      assert.deepEqual(evaluate(patchRow("DISPATCH.check", 0, patch)), fail, JSON.stringify(patch));
+    }
+  });
+
+  it("DISPATCH.function: each property and the body", () => {
+    const fail = structure("DISPATCH.function");
+    for (const patch of [
+      { nargs: 1 },
+      { returns_trigger: false },
+      { proretset: true },
+      { prosecdef: true },
+      { provolatile: "s" },
+      { lanname: "sql" },
+      { proconfig: null },
+      { proconfig: ["search_path=public"] },
+      { prosrc: `${DISPATCH_FUNCTION_BODY} ` },
+      { oid: 16500 },
+    ]) {
+      assert.deepEqual(evaluate(patchRow("DISPATCH.function", 0, patch)), fail, JSON.stringify(patch));
+    }
+    assert.deepEqual(evaluate(withRows("DISPATCH.function", [])), fail, "missing");
+    assert.deepEqual(evaluate(withRows("DISPATCH.function", undefined)), fail, "unreadable");
+    assert.deepEqual(evaluate(withRows("DISPATCH.function", [DISPATCH_FUNCTION_ROW, DISPATCH_FUNCTION_ROW])), fail, "an overload");
+  });
+
+  it("DISPATCH.trigger: missing, internal, on another function, wrong tgtype, arguments, a column list, a WHEN, duplicated", () => {
+    const fail = structure("DISPATCH.trigger");
+    for (const patch of [
+      { tgisinternal: true },
+      { tgfoid: "16501" },
+      { tgtype: "7" },
+      { nargs: 1 },
+      { no_columns: false },
+      { no_when: false },
+    ]) {
+      assert.deepEqual(evaluate(patchRow("DISPATCH.trigger", 0, patch)), fail, JSON.stringify(patch));
+    }
+    assert.deepEqual(evaluate(withRows("DISPATCH.trigger", [])), fail, "missing");
+    assert.deepEqual(evaluate(withRows("DISPATCH.trigger", undefined)), fail, "unreadable");
+    assert.deepEqual(evaluate(withRows("DISPATCH.trigger", [DISPATCH_TRIGGER_ROW, DISPATCH_TRIGGER_ROW])), fail, "two rows");
+  });
+
+  it("DISPATCH.trigger_enabled: disabled (D) and replica-only (R) fail; origin (O) and always (A) pass", () => {
+    for (const mode of ["D", "R"]) {
+      assert.deepEqual(evaluate(patchRow("DISPATCH.trigger", 0, { tgenabled: mode })), structure("DISPATCH.trigger_enabled"), mode);
+      assert.deepEqual(evaluate(patchRow("DISPATCH.trigger", 0, { tgenabled: mode }), "worker"), structure("DISPATCH.trigger_enabled"), mode);
+    }
+    for (const mode of ["O", "A"]) {
+      assert.deepEqual(evaluate(patchRow("DISPATCH.trigger", 0, { tgenabled: mode })), { ready: true }, mode);
+    }
+  });
+
+  it("profiles: the worker does not need EXECUTE on the status function; the API does", () => {
+    const noExecute = patchRow("S3.function", 0, { can_execute: false });
+    assert.deepEqual(evaluate(noExecute, "worker"), { ready: true });
+    assert.deepEqual(evaluate(noExecute, "api"), structure("S3"));
+    // Every other S3 property still applies to the worker (catalog reads).
+    assert.deepEqual(evaluate(patchRow("S3.function", 0, { prosecdef: false }), "worker"), structure("S3"));
+  });
+
+  it("S6.d: the worker requires TimeZone exactly UTC; the API does not evaluate it", () => {
+    const s6d = { ready: false, reason: "SESSION_INVARIANT", assertion: "S6.d" };
+    for (const rows of [[{ tz: "America/New_York" }], [{ tz: "Etc/UTC" }], [{ tz: "utc" }], [], undefined]) {
+      assert.deepEqual(evaluate(withRows("S6.d", rows), "worker"), s6d, JSON.stringify(rows));
+      assert.deepEqual(evaluate(withRows("S6.d", rows), "api"), { ready: true }, JSON.stringify(rows));
+    }
+  });
+
+  it("order: an existing failure keeps its reason when the dispatch observations are absent; RLE failures keep theirs", () => {
+    const noDispatch = (map: ReadinessObservations) => {
+      const copy = new Map(map);
+      for (const id of ["DISPATCH.columns", "DISPATCH.enum", "DISPATCH.index", "DISPATCH.check", "DISPATCH.function", "DISPATCH.trigger", "S6.d"] as const) {
+        copy.delete(id);
+      }
+      return copy;
+    };
+    assert.deepEqual(evaluate(noDispatch(withRows("S2", [{ fk_count: 0 }]))), structure("S2"));
+    assert.deepEqual(evaluate(noDispatch(patchRow("S3.function", 0, { can_execute: false }))), structure("S3"));
+    assert.deepEqual(evaluate(noDispatch(withRows("S6.c", [{ setconfig: ["transaction_timeout=60s"] }]))), {
+      ready: false,
+      reason: "SESSION_INVARIANT",
+      assertion: "S6.c",
+    });
+    assert.deepEqual(evaluate(noDispatch(withRows("RLE.table", [{ table_exists: false }]))), structure("RLE.table"));
+    assert.deepEqual(evaluate(noDispatch(withRows("RLE.pk", [{ pk_columns: null }]))), structure("RLE.pk"));
+    assert.deepEqual(evaluate(noDispatch(withRows("L2", []))), { ready: false, reason: "MIGRATION_MISSING" });
+    assert.deepEqual(evaluate(noDispatch(good())), structure("DISPATCH.columns"));
+    assert.deepEqual(evaluate(noDispatch(good()), "worker"), structure("DISPATCH.columns"));
+  });
+});
+
+// Q3 (Task 012B): the exported assertion unions, pinned in both directions. The
+// compiler refuses a missing member (an incomplete Record) and an extra one (an
+// excess property), so the names are explicit, unique and stable.
+const STRUCTURE_ASSERTIONS: Record<StructureAssertion, true> = {
+  S1: true,
+  S2: true,
+  S3: true,
+  S4: true,
+  S5: true,
+  "RLE.table": true,
+  "RLE.pk": true,
+  "RLE.lifecycle_uq": true,
+  "RLE.summary_range_uq": true,
+  "RLE.gap_discontinuity_uq": true,
+  "RLE.gap_unclean_uq": true,
+  "DISPATCH.columns": true,
+  "DISPATCH.enum": true,
+  "DISPATCH.index": true,
+  "DISPATCH.check": true,
+  "DISPATCH.function": true,
+  "DISPATCH.trigger": true,
+  "DISPATCH.trigger_enabled": true,
+};
+const SESSION_ASSERTIONS: Record<SessionAssertion, true> = { "S6.a": true, "S6.b": true, "S6.c": true, "S6.d": true };
+
+describe("Q3: every readiness assertion name, old and new, is produced by some defect", () => {
+  const producers: Record<StructureAssertion | SessionAssertion, () => SchemaReadiness> = {
+    S1: () => evaluateReadiness(withRows("S1.index", undefined)),
+    S2: () => evaluateReadiness(withRows("S2", [{ fk_count: 0 }])),
+    S3: () => evaluateReadiness(withRows("S3.function", [])),
+    S4: () => evaluateReadiness(withRows("S4", [])),
+    S5: () => evaluateReadiness(withRows("S5", [{ pk_columns: null }])),
+    "RLE.table": () => evaluateReadiness(withRows("RLE.table", undefined)),
+    "RLE.pk": () => evaluateReadiness(withRows("RLE.pk", undefined)),
+    "RLE.lifecycle_uq": () => evaluateReadiness(withRows("RLE.indexes", RLE_INDEXES.filter((i) => i.index_name !== "rle_instance_lifecycle_uq"))),
+    "RLE.summary_range_uq": () => evaluateReadiness(withRows("RLE.indexes", RLE_INDEXES.filter((i) => i.index_name !== "rle_summary_range_uq"))),
+    "RLE.gap_discontinuity_uq": () =>
+      evaluateReadiness(withRows("RLE.indexes", RLE_INDEXES.filter((i) => i.index_name !== "rle_gap_discontinuity_uq"))),
+    "RLE.gap_unclean_uq": () => evaluateReadiness(withRows("RLE.indexes", RLE_INDEXES.filter((i) => i.index_name !== "rle_gap_unclean_uq"))),
+    "DISPATCH.columns": () => evaluateReadiness(withRows("DISPATCH.columns", [])),
+    "DISPATCH.enum": () => evaluateReadiness(withRows("DISPATCH.enum", [])),
+    "DISPATCH.index": () => evaluateReadiness(withRows("DISPATCH.index", [])),
+    "DISPATCH.check": () => evaluateReadiness(withRows("DISPATCH.check", [])),
+    "DISPATCH.function": () => evaluateReadiness(withRows("DISPATCH.function", [])),
+    "DISPATCH.trigger": () => evaluateReadiness(withRows("DISPATCH.trigger", [])),
+    "DISPATCH.trigger_enabled": () => evaluateReadiness(patchRow("DISPATCH.trigger", 0, { tgenabled: "D" })),
+    "S6.a": () => evaluateReadiness(withRows("S6.a", [{ server_version_num: 160000 }])),
+    "S6.b": () => evaluateReadiness(withRows("S6.b", undefined)),
+    "S6.c": () => evaluateReadiness(withRows("S6.c", undefined)),
+    "S6.d": () => evaluateReadiness(withRows("S6.d", [{ tz: "America/New_York" }]), REQUIRED_MIGRATIONS, "worker"),
+  };
+
+  it("the pins list 18 structure and 4 session names, and each one is produced by its own defect", () => {
+    assert.equal(Object.keys(STRUCTURE_ASSERTIONS).length, 18);
+    assert.equal(Object.keys(SESSION_ASSERTIONS).length, 4);
+    assert.deepEqual(Object.keys(producers).sort(), [...Object.keys(STRUCTURE_ASSERTIONS), ...Object.keys(SESSION_ASSERTIONS)].sort());
+    for (const [name, produce] of Object.entries(producers)) {
+      const result = produce();
+      assert.equal(result.ready, false, name);
+      assert.equal("assertion" in result ? result.assertion : undefined, name, name);
+      const expectedReason = name in SESSION_ASSERTIONS ? "SESSION_INVARIANT" : "STRUCTURE_MISMATCH";
+      assert.equal(result.ready === false ? result.reason : undefined, expectedReason, name);
+    }
   });
 });
 

@@ -13,11 +13,13 @@ import {
   withUser,
 } from "./test-support/guard.js";
 import type { GuardedConnection } from "./test-support/guard.js";
-import { listDatabases, listRoles } from "./test-support/inspect.js";
+import { listDatabases, listRoles, readPasswordPresence, readRole } from "./test-support/inspect.js";
 import { sqlState } from "./test-support/pg.js";
 import type { PgClient } from "./test-support/pg.js";
-import { grantProblems } from "./test-support/provision.js";
-import { SPECIAL_ROLES, STATUS_FUNCTION } from "./test-support/registry.js";
+import { grantProblems, roleProfileProblems } from "./test-support/provision.js";
+import { bootstrapRoles, bootstrapScratch, dropScratch } from "./test-support/bootstrap.js";
+import { SPECIAL_ROLES, STATUS_FUNCTION, WORKER_ROLE, scratchDatabaseName } from "./test-support/registry.js";
+import { withDatabase } from "./test-support/guard.js";
 
 // Guard refusals that need the database, bootstrap re-run refusals, and the
 // provisioned grant set (FD-2). Connections are api mode unless stated.
@@ -130,6 +132,64 @@ describe("guard: post-connect refusals", () => {
       });
       await special.close();
     }
+  });
+});
+
+describe("guard: worker mode in the database (Task 012B, B1-8, Q2)", () => {
+  const workerUrl = requireTestUrl("IRS_TEST_WORKER_DATABASE_URL");
+
+  it("worker mode passes for irs_test_worker on irs_011_test: profile, sentinel and exact grant set (control)", async () => {
+    validateTarget(workerUrl, "worker");
+    const worker = await connectGuarded({ url: workerUrl, mode: "worker" });
+    await worker.close();
+  });
+
+  it("refuses with role-profile when another role is verified against the worker's profile (irs_test_api is INHERIT, no limit)", async () => {
+    await withApiClient((client) =>
+      refused("role-profile", () => verifyPostConnect(client, { database: "irs_011_test", user: "irs_test_api", mode: "worker" })),
+    );
+  });
+
+  it("refuses with worker-grants where the worker holds the sentinel but not its registered grants (a scratch database without them)", async () => {
+    const adminScratchUrl = await bootstrapScratch(admin, adminUrl, "dispatch");
+    try {
+      // The scratch database's sentinel grants the worker read access; no migration and no application grant.
+      await refused("worker-grants", () =>
+        connectGuarded({ url: withDatabase(workerUrl, scratchDatabaseName("dispatch")), mode: "worker" }),
+      );
+      void adminScratchUrl;
+    } finally {
+      await dropScratch(admin, "dispatch");
+    }
+  });
+
+  it("the worker's profile holds in both directions, with no password (admin, Boolean only)", async () => {
+    const record = await readRole(admin.client, WORKER_ROLE);
+    assert.deepEqual(record, {
+      name: WORKER_ROLE,
+      super: false,
+      login: true,
+      createdb: false,
+      createrole: false,
+      replication: false,
+      bypassrls: false,
+      inherit: false,
+      memberOf: [],
+      connectionLimit: 16,
+      validUntilSet: false,
+      members: [],
+    });
+    assert.equal(await readPasswordPresence(admin.client, WORKER_ROLE), false);
+    // Control: the Boolean read distinguishes a missing role (undefined) from a role without a password.
+    assert.equal(await readPasswordPresence(admin.client, `irs_test_absent_${randomUUID().slice(0, 8)}`), undefined);
+    assert.deepEqual(await roleProfileProblems(admin.client), []);
+  });
+
+  it("bootstrap-roles on the provisioned cluster reports the worker present and verified, and changes nothing", async () => {
+    const rolesBefore = await listRoles(admin.client);
+    const evidence = await bootstrapRoles(adminUrl);
+    assert.ok(evidence.some((line) => line.startsWith(`present, verified: ${WORKER_ROLE}`)), evidence.join(" | "));
+    assert.deepEqual(await listRoles(admin.client), rolesBefore);
   });
 });
 

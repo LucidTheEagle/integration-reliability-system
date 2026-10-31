@@ -21,6 +21,12 @@ enum EventState {
   DUPLICATE
 }
 
+// Task 012B (ADD §3.3c, B1-2): the kind of the first observed dispatch anomaly.
+enum DispatchAnomalyKind {
+  COMPLETED_WHILE_QUEUED
+  FAILED_WHILE_QUEUED
+}
+
 enum OperationState {
   PENDING
   PROCESSING
@@ -177,12 +183,24 @@ model Event {
   rawBody         Bytes
   rawBodySha256   String
 
+  // Task 012B dispatch evidence (DR5 §5, ADD §3.3c; B1-1, B1-2). Written by SQL now() only.
+  queuedAt              DateTime?            @db.Timestamptz(3)
+  lastPublishAttemptAt  DateTime?            @db.Timestamptz(3)
+  publishAttemptCount   Int                  @default(0)
+  publishAckedAt        DateTime?            @db.Timestamptz(3)
+  lastPublishAckAt      DateTime?            @db.Timestamptz(3)
+  redispatchRequestedAt DateTime?            @db.Timestamptz(3)
+  redispatchCount       Int                  @default(0)
+  dispatchAnomalyAt     DateTime?            @db.Timestamptz(3)
+  dispatchAnomalyKind   DispatchAnomalyKind?
+
   integration Integration @relation(fields: [integrationId], references: [id], onDelete: Restrict)
   operations  Operation[]
 
   @@unique([integrationId, externalEventId])
   @@index([status])
   @@index([receivedAt])
+  @@index([status, receivedAt])
 }
 
 // INVARIANT (application-layer, not database-enforced): an Operation's

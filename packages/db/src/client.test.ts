@@ -36,6 +36,7 @@ describe("built @irs/db entry (VPF-1(c))", () => {
       "disconnectWithin",
       "findEvidenceRecoveryCandidates",
       "ingestEvent",
+      "insertDispatchAuditEntry",
       "readEvidenceDurableState",
       "readEvidenceRegistration",
       "sha256Hex",
@@ -71,6 +72,57 @@ describe("built @irs/db entry (VPF-1(c))", () => {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+});
+
+/** Task 012B (PL-8): the startup parameters a pool sends, observed on a test-owned loopback socket (FD-7). */
+async function startupParameters(options: Omit<Parameters<typeof entry.createDatabase>[0], "connectionString">): Promise<Record<string, string>> {
+  let packet: Buffer | undefined;
+  const sockets: Socket[] = [];
+  const server = createServer((socket) => {
+    sockets.push(socket);
+    socket.on("error", () => undefined);
+    socket.once("data", (chunk: Buffer) => {
+      packet = chunk;
+      socket.destroy();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  const db = entry.createDatabase({ connectionString: `postgresql://irs_no_database@127.0.0.1:${port}/irs_no_database_test`, ...options });
+  try {
+    await db.ping().catch(() => undefined);
+    assert.ok(packet !== undefined, "a startup packet was received");
+    const body = packet.subarray(8, packet.readInt32BE(0));
+    const fields = body.toString("utf8").split("\0").filter((field) => field !== "");
+    const parameters: Record<string, string> = {};
+    for (let i = 0; i + 1 < fields.length; i += 2) parameters[fields[i] ?? ""] = fields[i + 1] ?? "";
+    return parameters;
+  } finally {
+    await db.prisma.$disconnect();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+describe("R1 (Task 012B, PL-8): the worker's session time zone is a startup parameter", () => {
+  it("sessionTimeZone UTC sends options '-c transaction_timeout=0 -c TimeZone=UTC' on every connection start", async () => {
+    const parameters = await startupParameters({ pool: { maxConnections: 3 }, sessionTimeZone: "UTC" });
+    process.stdout.write(`[R1 client] worker startup parameters ${JSON.stringify(parameters)}\n`);
+    assert.equal(parameters.options, "-c transaction_timeout=0 -c TimeZone=UTC");
+    assert.equal(parameters.statement_timeout, "5000");
+  });
+
+  it("control: the default (the API's) still sends exactly '-c transaction_timeout=0'", async () => {
+    const parameters = await startupParameters({});
+    assert.equal(parameters.options, "-c transaction_timeout=0");
+  });
+
+  it("toPgPoolConfig maps the pin to the options string only", () => {
+    const pinned = toPgPoolConfig("postgresql://u@127.0.0.1:1/d", DEFAULT_POOL_SETTINGS, "UTC");
+    const plain = toPgPoolConfig("postgresql://u@127.0.0.1:1/d", DEFAULT_POOL_SETTINGS);
+    assert.equal(pinned.options, "-c transaction_timeout=0 -c TimeZone=UTC");
+    assert.deepEqual({ ...pinned, options: plain.options }, plain);
   });
 });
 

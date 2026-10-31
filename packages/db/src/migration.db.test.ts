@@ -11,7 +11,13 @@ import { sqlState } from "./test-support/pg.js";
 import type { PgClient } from "./test-support/pg.js";
 import { runPrismaCli } from "./test-support/prisma-cli.js";
 import { SHADOW_DATABASE, STATUS_FUNCTION } from "./test-support/registry.js";
-import { RATE_LIMIT_EVIDENCE_INDEXES, REQUIRED_MIGRATIONS } from "./schema-readiness.js";
+import {
+  DISPATCH_CHECK_DEFINITION,
+  DISPATCH_COLUMNS,
+  DISPATCH_INDEX_DEFINITION,
+  RATE_LIMIT_EVIDENCE_INDEXES,
+  REQUIRED_MIGRATIONS,
+} from "./schema-readiness.js";
 
 // MIG-T1 – MIG-T3 (Rev 1.7 §16.3) and M2 (Addendum VPF-6).
 
@@ -42,6 +48,37 @@ const GOLDEN_RLE_CHECKS = {
   rle_kind_ck: `CHECK ((kind = ANY (ARRAY['INSTANCE_STARTED'::text, 'SUMMARY'::text, 'EVIDENCE_GAP'::text, 'INSTANCE_CLOSED'::text])))`,
   rle_summary_shape_ck: `CHECK (((kind <> 'SUMMARY'::text) OR (("firstSequence" IS NOT NULL) AND ("lastSequence" IS NOT NULL) AND ("firstSequence" >= 1) AND ("lastSequence" >= "firstSequence"))))`,
 };
+
+/**
+ * Task 012B (B1-5, PL-2): golden PostgreSQL 17.11 text of the trigger function
+ * (pg_get_functiondef) and of the trigger (pg_get_triggerdef, in this file's
+ * fixed api-mode test session), captured once (012B-2 RUN A, A6) and changed
+ * only by deliberate review. The CHECK's and the index's golden text is in
+ * schema-readiness.ts, which readiness also pins. Placeholders until captured.
+ */
+const GOLDEN_DISPATCH_FUNCTIONDEF = "CREATE OR REPLACE FUNCTION public.irs_event_dispatch_marker_guard()\n RETURNS trigger\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog', 'pg_temp'\nAS $function$\nBEGIN\n  IF TG_OP = 'INSERT' THEN\n    IF NEW.\"dispatchAnomalyAt\" IS NOT NULL OR NEW.\"dispatchAnomalyKind\" IS NOT NULL THEN\n      RAISE EXCEPTION 'irs dispatch marker rule T0' USING ERRCODE = 'IRST0';\n    END IF;\n    RETURN NEW;\n  END IF;\n  IF OLD.\"dispatchAnomalyAt\" IS NOT NULL\n     AND (NEW.\"dispatchAnomalyAt\" IS DISTINCT FROM OLD.\"dispatchAnomalyAt\"\n          OR NEW.\"dispatchAnomalyKind\" IS DISTINCT FROM OLD.\"dispatchAnomalyKind\") THEN\n    RAISE EXCEPTION 'irs dispatch marker rule T2' USING ERRCODE = 'IRST2';\n  END IF;\n  IF OLD.\"dispatchAnomalyAt\" IS NULL AND NEW.\"dispatchAnomalyAt\" IS NOT NULL\n     AND NOT (OLD.\"status\" = 'QUEUED'::\"public\".\"EventState\"\n              AND NEW.\"status\" = 'QUEUED'::\"public\".\"EventState\"\n              AND NEW.\"dispatchAnomalyKind\" IS NOT NULL) THEN\n    RAISE EXCEPTION 'irs dispatch marker rule T1' USING ERRCODE = 'IRST1';\n  END IF;\n  IF NEW.\"status\" = 'PROCESSING'::\"public\".\"EventState\"\n     AND (OLD.\"dispatchAnomalyAt\" IS NOT NULL OR NEW.\"dispatchAnomalyAt\" IS NOT NULL) THEN\n    RAISE EXCEPTION 'irs dispatch marker rule T3' USING ERRCODE = 'IRST3';\n  END IF;\n  RETURN NEW;\nEND\n$function$\n";
+const GOLDEN_DISPATCH_TRIGGERDEF = "CREATE TRIGGER irs_event_dispatch_marker_guard BEFORE INSERT OR UPDATE ON public.\"Event\" FOR EACH ROW EXECUTE FUNCTION irs_event_dispatch_marker_guard()";
+/** ADD §6: T3's exact predicate (the partner's), asserted in the golden definition. */
+const T3_PREDICATE = [
+  `  IF NEW."status" = 'PROCESSING'::"public"."EventState"`,
+  `     AND (OLD."dispatchAnomalyAt" IS NOT NULL OR NEW."dispatchAnomalyAt" IS NOT NULL) THEN`,
+  `    RAISE EXCEPTION 'irs dispatch marker rule T3' USING ERRCODE = 'IRST3';`,
+].join("\n");
+const DISPATCH_FUNCTION = "irs_event_dispatch_marker_guard";
+const DISPATCH_CHECK = "Event_dispatchAnomaly_consistency_check";
+
+async function dispatchColumns(client: PgClient): Promise<unknown[]> {
+  const result = await client.query(
+    `SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS notnull,
+            pg_get_expr(d.adbin, d.adrelid) AS column_default
+       FROM pg_catalog.pg_attribute a
+       LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+      WHERE a.attrelid = 'public."Event"'::regclass AND NOT a.attisdropped
+        AND a.attname IN (${DISPATCH_COLUMNS.map((column) => `'${column.column_name}'`).join(", ")})
+      ORDER BY a.attname`,
+  );
+  return result.rows;
+}
 
 // Admin mode: migrations, scratch databases and catalog snapshots.
 let admin: GuardedConnection;
@@ -131,6 +168,12 @@ describe("MIG-T1: migrate deploy on an empty database", () => {
           labels.rows[0]?.labels,
           "RECEIVED,VALIDATED,QUEUED,PROCESSING,SUCCEEDED,RETRYING,FAILED,UNKNOWN,REJECTED,DUPLICATE",
         );
+        // Task 012B (PL-2): the new enum's labels, in order.
+        const anomalyLabels = await c.query<{ labels: string }>(
+          `SELECT string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) AS labels FROM pg_catalog.pg_enum e
+            WHERE e.enumtypid = 'public."DispatchAnomalyKind"'::regtype`,
+        );
+        assert.equal(anomalyLabels.rows[0]?.labels, "COMPLETED_WHILE_QUEUED,FAILED_WHILE_QUEUED");
 
         const columns = await c.query<{ attname: string; type: string; notnull: boolean; has_default: boolean }>(
           `SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS notnull, a.atthasdef AS has_default
@@ -142,12 +185,28 @@ describe("MIG-T1: migrate deploy on an empty database", () => {
           { attname: "rawBody", type: "bytea", notnull: true, has_default: false },
           { attname: "rawBodySha256", type: "text", notnull: true, has_default: false },
         ]);
+        // Task 012B (PL-2): the nine dispatch columns, type, NOT NULL and default.
+        assert.deepEqual(await dispatchColumns(c), DISPATCH_COLUMNS.map((column) => ({ ...column })));
 
         const checks = await checkConstraints(c);
         assert.deepEqual(checks, {
+          [DISPATCH_CHECK]: { def: DISPATCH_CHECK_DEFINITION, validated: true },
           Event_rawBodySha256_format_check: { def: GOLDEN_CHECKS.Event_rawBodySha256_format_check, validated: true },
           Event_rawBody_length_check: { def: GOLDEN_CHECKS.Event_rawBody_length_check, validated: true },
         });
+
+        // Task 012B (PL-2): the index's golden text; the function; the trigger on it, not internal, origin-enabled.
+        const dispatchIndex = await c.query<{ def: string }>(
+          `SELECT pg_get_indexdef(i.indexrelid) AS def FROM pg_catalog.pg_index i
+             JOIN pg_catalog.pg_class x ON x.oid = i.indexrelid WHERE x.relname = 'Event_status_receivedAt_idx'`,
+        );
+        assert.deepEqual(dispatchIndex.rows, [{ def: DISPATCH_INDEX_DEFINITION }]);
+        const trigger = await c.query<{ fn: string; tgisinternal: boolean; tgenabled: string }>(
+          `SELECT tg.tgfoid::regproc::text AS fn, tg.tgisinternal, tg.tgenabled::text AS tgenabled
+             FROM pg_catalog.pg_trigger tg WHERE tg.tgrelid = 'public."Event"'::regclass AND tg.tgname = $1`,
+          [DISPATCH_FUNCTION],
+        );
+        assert.deepEqual(trigger.rows, [{ fn: DISPATCH_FUNCTION, tgisinternal: false, tgenabled: "O" }]);
 
         const absent = await c.query<{ rle: string | null; fn: string | null }>(
           `SELECT to_regclass('public."RateLimitEvidence"')::text AS rle,
@@ -271,16 +330,73 @@ describe("MIG-T3 blindness for Task 011A's raw SQL (IRS-C-055; documentation)", 
     assert.match(script.stdout, /empty migration/i);
     for (const object of objects) assert.ok(!script.stdout.includes(object), `${object} not in the drift script`);
   });
+
+  it("Task 012B (PL-2): the event_dispatch migration's CHECK and trigger function are in the migration, absent from the schema and from the drift script", async () => {
+    const migrations = fileURLToPath(new URL("../../../prisma/migrations/", import.meta.url));
+    const name = REQUIRED_MIGRATIONS.find((entry) => entry.endsWith("_event_dispatch")) ?? "";
+    assert.notEqual(name, "");
+    const sql = readFileSync(`${migrations}${name}/migration.sql`, "utf8");
+    const schema = readFileSync(fileURLToPath(new URL("../../../prisma/schema.prisma", import.meta.url)), "utf8");
+    const objects = [DISPATCH_CHECK, DISPATCH_FUNCTION];
+    for (const object of objects) {
+      assert.ok(sql.includes(object), `${object} in the migration`);
+      assert.ok(!schema.includes(object), `${object} not in the schema`);
+    }
+    // Positive control: the Prisma-modelled index is in both the migration and the schema's model.
+    assert.ok(sql.includes("Event_status_receivedAt_idx"));
+    assert.match(schema, /@@index\(\[status, receivedAt\]\)/);
+    const shadowUrl = withDatabase(adminUrl, SHADOW_DATABASE);
+    const script = await runPrismaCli(
+      [
+        "migrate",
+        "diff",
+        "--from-migrations",
+        "prisma/migrations",
+        "--to-schema",
+        "prisma/schema.prisma",
+        "--script",
+        "--config",
+        "packages/db/src/test-support/prisma.drift.config.ts",
+      ],
+      { IRS_DRIFT_DATASOURCE_URL: adminUrl, IRS_DRIFT_SHADOW_DATABASE_URL: shadowUrl },
+    );
+    process.stdout.write(`[IRS-C-055 012B] --script: exit ${script.exitCode}; ${(script.stdout + script.stderr).trim()}\n`);
+    assert.equal(script.exitCode, 0, script.stderr);
+    assert.match(script.stdout, /empty migration/i);
+    for (const object of objects) assert.ok(!script.stdout.includes(object), `${object} not in the drift script`);
+  });
 });
 
 describe("M2: TD-3 CHECKs in the catalog", () => {
-  it("pg_constraint holds both CHECKs, validated, with the golden PostgreSQL 17 text", async () => {
+  it("pg_constraint holds the three Event CHECKs (both TD-3 and Task 012B's), validated, with the golden PostgreSQL 17 text", async () => {
     const api = await connectGuarded({ url: apiUrl, mode: "api" });
     try {
       assert.deepEqual(await checkConstraints(api.client), {
+        [DISPATCH_CHECK]: { def: DISPATCH_CHECK_DEFINITION, validated: true },
         Event_rawBodySha256_format_check: { def: GOLDEN_CHECKS.Event_rawBodySha256_format_check, validated: true },
         Event_rawBody_length_check: { def: GOLDEN_CHECKS.Event_rawBody_length_check, validated: true },
       });
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("Task 012B (PL-2): the trigger function and the trigger match their golden PostgreSQL 17.11 text, T3's exact predicate included", async () => {
+    const api = await connectGuarded({ url: apiUrl, mode: "api" });
+    try {
+      const fn = await api.client.query<{ def: string }>(
+        `SELECT pg_get_functiondef(p.oid) AS def FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = $1`,
+        [DISPATCH_FUNCTION],
+      );
+      assert.deepEqual(fn.rows, [{ def: GOLDEN_DISPATCH_FUNCTIONDEF }]);
+      assert.ok(GOLDEN_DISPATCH_FUNCTIONDEF.includes(T3_PREDICATE), "T3's exact predicate is in the golden definition");
+      const trigger = await api.client.query<{ def: string }>(
+        `SELECT pg_get_triggerdef(tg.oid) AS def FROM pg_catalog.pg_trigger tg
+          WHERE tg.tgrelid = 'public."Event"'::regclass AND tg.tgname = $1`,
+        [DISPATCH_FUNCTION],
+      );
+      assert.deepEqual(trigger.rows, [{ def: GOLDEN_DISPATCH_TRIGGERDEF }]);
     } finally {
       await api.close();
     }

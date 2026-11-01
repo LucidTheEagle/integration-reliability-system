@@ -29,7 +29,7 @@ const FN = `"public"."irs_event_dispatch_marker_guard"()`;
  * observed by this test's first run (012B-2 RUN A, A7) and then pinned.
  * A placeholder until then.
  */
-const F5_DIRECT_CALL_SQLSTATE = "PLACEHOLDER-NOT-CAPTURED:F5";
+const F5_DIRECT_CALL_SQLSTATE = "42501";
 /** Q1: the trigger function's exact ACL, captured from irs_011_test (A6). A placeholder until then. */
 const GOLDEN_DISPATCH_FUNCTION_ACL = "{postgres=X/postgres}";
 

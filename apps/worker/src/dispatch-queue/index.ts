@@ -1,6 +1,8 @@
-import { BULLMQ_FACTORIES, openDispatchQueueWith, publishJob, startDispatchWorkerWith } from "./implementation.js";
+import { BULLMQ_FACTORIES, openDispatchProbeWith, openDispatchQueueWith, publishJob, startDispatchWorkerWith } from "./implementation.js";
 import type {
+  DispatchErrorObserver,
   DispatchJobData,
+  DispatchProbeHandle,
   DispatchProcessor,
   DispatchQueueHandle,
   DispatchSettings,
@@ -27,22 +29,34 @@ export {
 } from "./policy.js";
 export type { DispatchQueueCheck } from "./policy.js";
 export type {
+  DispatchErrorObserver,
   DispatchJobCounts,
   DispatchJobData,
   DispatchJobRecord,
   DispatchJobState,
   DispatchJobView,
   DispatchJsonValue,
+  DispatchProbeHandle,
   DispatchProcessor,
   DispatchQueueHandle,
+  DispatchRetirement,
   DispatchSettings,
   DispatchWorkerHandle,
   DispatchWorkerSettings,
 } from "./types.js";
 
-/** Opens the dispatch queue (producer side) with the fixed name and default job options. */
-export function openDispatchQueue(settings: DispatchSettings): DispatchQueueHandle {
-  return openDispatchQueueWith(BULLMQ_FACTORIES, settings);
+/**
+ * Opens the dispatch queue (producer side) with the fixed name and default job
+ * options. `onError`, if given, receives the classified code of each
+ * connection error event (B2-6).
+ */
+export function openDispatchQueue(settings: DispatchSettings, onError?: DispatchErrorObserver): DispatchQueueHandle {
+  return openDispatchQueueWith(BULLMQ_FACTORIES, settings, onError);
+}
+
+/** Opens the separate, bounded probe connection (FD-19): PING only. */
+export function openDispatchProbe(settings: DispatchSettings, onError?: DispatchErrorObserver): DispatchProbeHandle {
+  return openDispatchProbeWith(BULLMQ_FACTORIES, settings, onError);
 }
 
 /**

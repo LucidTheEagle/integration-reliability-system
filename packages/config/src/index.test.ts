@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ConfigValidationError, loadConfig } from "./index.js";
+import { ConfigValidationError, loadConfig, loadWorkerConfig } from "./index.js";
 
 const validEnv = {
   DATABASE_URL: "postgresql://user:password@localhost:5432/irs",
@@ -284,6 +284,91 @@ describe("loadConfig — error messages never echo the raw value", () => {
       expect(error).toBeInstanceOf(ConfigValidationError);
       expect((error as ConfigValidationError).issues).toEqual([
         expect.stringContaining("REDIS_HOST"),
+      ]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 012B-3 (B2-5): the worker's configuration
+// ---------------------------------------------------------------------------
+
+const validWorkerEnv = {
+  WORKER_DATABASE_URL: "postgresql://irs_test_worker@127.0.0.1:55433/irs_011_test",
+  REDIS_HOST: "127.0.0.1",
+  REDIS_PORT: "46379",
+  REDIS_PASSWORD_FILE: "secrets/redis_test_password",
+};
+
+const WORKER_KEYS = [
+  "WORKER_DATABASE_URL",
+  "REDIS_HOST",
+  "REDIS_PORT",
+  "REDIS_PASSWORD_FILE",
+];
+
+function issuesOf(action: () => unknown): readonly string[] {
+  try {
+    action();
+  } catch (error) {
+    expect(error).toBeInstanceOf(ConfigValidationError);
+    return (error as ConfigValidationError).issues;
+  }
+  throw new Error("expected a ConfigValidationError");
+}
+
+describe("loadWorkerConfig — valid configuration", () => {
+  it("returns a typed, deep-frozen worker configuration", () => {
+    const config = loadWorkerConfig(validWorkerEnv);
+    expect(config).toEqual({
+      database: { url: validWorkerEnv.WORKER_DATABASE_URL },
+      redis: { host: "127.0.0.1", port: 46379, passwordFile: "secrets/redis_test_password" },
+    });
+    expect(typeof config.redis.port).toBe("number");
+    expect(Object.isFrozen(config)).toBe(true);
+    expect(Object.isFrozen(config.database)).toBe(true);
+    expect(Object.isFrozen(config.redis)).toBe(true);
+  });
+
+  it("does not require the API's ports", () => {
+    expect(() => loadWorkerConfig(validWorkerEnv)).not.toThrow();
+    expect(() => loadWorkerConfig({ ...validWorkerEnv, API_PORT: "not-a-port", WEB_PORT: "" })).not.toThrow();
+  });
+});
+
+describe("loadWorkerConfig — missing and refused values", () => {
+  it.each(WORKER_KEYS)("names %s as required when it is missing", (key) => {
+    expect(issuesOf(() => loadWorkerConfig(omit(validWorkerEnv, key)))).toEqual([`${key}: is required`]);
+  });
+
+  it("never falls back to DATABASE_URL", () => {
+    const env = { ...omit(validWorkerEnv, "WORKER_DATABASE_URL"), DATABASE_URL: validWorkerEnv.WORKER_DATABASE_URL };
+    expect(issuesOf(() => loadWorkerConfig(env))).toEqual(["WORKER_DATABASE_URL: is required"]);
+  });
+
+  it("reports all four missing variables in one error", () => {
+    expect(issuesOf(() => loadWorkerConfig({}))).toEqual(WORKER_KEYS.map((key) => `${key}: is required`));
+  });
+
+  it("a planted marker in every value never appears in the message or the issues", () => {
+    const marker = "planted-marker-7f3a";
+    const env = {
+      WORKER_DATABASE_URL: `${marker}-database`,
+      REDIS_HOST: `${marker}-host`,
+      REDIS_PORT: `${marker}-port`,
+      REDIS_PASSWORD_FILE: `${marker}-file`,
+    };
+    try {
+      loadWorkerConfig(env);
+      throw new Error("expected a ConfigValidationError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigValidationError);
+      const refusal = error as ConfigValidationError;
+      expect(refusal.message).not.toContain(marker);
+      expect(refusal.issues.join("\n")).not.toContain(marker);
+      expect(refusal.issues).toEqual([
+        "WORKER_DATABASE_URL: must be a non-empty postgres:// or postgresql:// connection string",
+        "REDIS_PORT: must be a whole number between 1 and 65535",
       ]);
     }
   });

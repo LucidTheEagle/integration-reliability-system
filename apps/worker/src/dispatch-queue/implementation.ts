@@ -7,6 +7,7 @@ import {
   DISPATCH_REMOVE_ON_COMPLETE,
   DispatchQueueError,
   DispatchRedisError,
+  JOB_HASH_FIELDS,
   PRODUCER_CONNECTION_PROFILE,
   WORKER_CONNECTION_PROFILE,
   checkConcurrency,
@@ -16,15 +17,20 @@ import {
   checkJobOptions,
   checkWorkerOptions,
   classifyRedisError,
+  isPongReply,
+  parseJobHash,
 } from "./policy.js";
 import type {
+  DispatchErrorObserver,
   DispatchJobCounts,
   DispatchJobData,
   DispatchJobRecord,
   DispatchJobState,
   DispatchJobView,
+  DispatchProbeHandle,
   DispatchProcessor,
   DispatchQueueHandle,
+  DispatchRetirement,
   DispatchSettings,
   DispatchWorkerHandle,
   DispatchWorkerSettings,
@@ -45,6 +51,19 @@ export interface RawJob {
   readonly opts: { readonly removeOnFail?: unknown; readonly removeOnComplete?: unknown };
 }
 
+/**
+ * The three members of the Queue's own connection this module uses (Task
+ * 012B-3: FD-16, FD-19, FD-20; RC-7): the `ready` event (the lifetime
+ * everReady flag), the forced close, and the client promise, typed as a plain
+ * object and narrowed at run time by the two guards below. Never exported
+ * from the public entry.
+ */
+export interface RawQueueConnection {
+  on(event: "ready", listener: () => void): unknown;
+  close(force: boolean): Promise<void>;
+  readonly client: Promise<object>;
+}
+
 export interface RawQueue {
   add(name: string, data: DispatchJobData, options: JobsOptions): Promise<{ readonly id?: string | undefined }>;
   getJob(jobId: string): Promise<RawJob | undefined>;
@@ -52,6 +71,8 @@ export interface RawQueue {
   getJobCounts(): Promise<{ readonly [state: string]: number }>;
   on(event: "error", listener: (error: Error) => void): unknown;
   close(): Promise<void>;
+  getBackend(): RawQueueConnection;
+  toKey(type: string): string;
 }
 
 export interface RawWorker {
@@ -67,7 +88,12 @@ export interface BullmqFactories {
 }
 
 export const BULLMQ_FACTORIES: BullmqFactories = Object.freeze({
-  createQueue: (name: string, options: QueueOptions) => new Queue(name, options),
+  // A block body with a local constant (RC-7): the construction is typed on
+  // its own, then checked against RawQueue; no type assertion.
+  createQueue: (name: string, options: QueueOptions) => {
+    const queue = new Queue(name, options);
+    return queue;
+  },
   createWorker: (name: string, processor: (job: RawJob) => Promise<void>, options: WorkerOptions) =>
     new Worker(name, processor, options),
 });
@@ -108,14 +134,34 @@ function jobView(job: RawJob): DispatchJobView {
   return Object.freeze({ id: idOf(job), data: frozenCopy(job.data), attemptsMade: job.attemptsMade });
 }
 
-function jobRecord(job: RawJob): DispatchJobRecord {
-  return Object.freeze({
+/**
+ * id, data and the retention options from the library's job read; attemptsMade,
+ * both times and both digests from the one HMGET (FD-17). Absent fields are
+ * omitted.
+ */
+function jobRecord(job: RawJob, fields: ReturnType<typeof parseJobHash>): DispatchJobRecord {
+  const record: {
+    id: string;
+    data: unknown;
+    attemptsMade: number;
+    removeOnFail: unknown;
+    removeOnComplete: unknown;
+    processedOn?: number;
+    finishedOn?: number;
+    returnValueSha256?: string;
+    failedReasonSha256?: string;
+  } = {
     id: idOf(job),
     data: frozenCopy(job.data),
-    attemptsMade: job.attemptsMade,
+    attemptsMade: fields.attemptsMade,
     removeOnFail: frozenCopy(job.opts.removeOnFail),
     removeOnComplete: frozenCopy(job.opts.removeOnComplete),
-  });
+  };
+  if (fields.processedOn !== undefined) record.processedOn = fields.processedOn;
+  if (fields.finishedOn !== undefined) record.finishedOn = fields.finishedOn;
+  if (fields.returnValueSha256 !== undefined) record.returnValueSha256 = fields.returnValueSha256;
+  if (fields.failedReasonSha256 !== undefined) record.failedReasonSha256 = fields.failedReasonSha256;
+  return Object.freeze(record);
 }
 
 function count(counts: { readonly [state: string]: number }, state: string): number {
@@ -150,6 +196,9 @@ async function redisCall<T>(operation: () => Promise<T>): Promise<T> {
 // (DispatchRedisError); how it is reported is decided in 012B.
 function ignoreErrorEvent(): void {}
 
+/** A rejection already handled: the closing promise's outcome reaches close()'s caller, never an unhandled rejection. */
+function ignoreRejection(): void {}
+
 function connection(settings: DispatchSettings) {
   return { host: settings.host, port: settings.port, password: settings.password };
 }
@@ -176,6 +225,23 @@ function queueOptions(settings: DispatchSettings): QueueOptions {
   return options;
 }
 
+/**
+ * The probe connection's options (FD-19): a new plain connection object built
+ * from the settings' host, port and password (never a client), the producer
+ * profile, and no command of the library's own: skipMetasUpdate stops the
+ * metadata write and skipVersionCheck the version INFO. The prefix when one is
+ * set (S-10).
+ */
+function probeOptions(settings: DispatchSettings): QueueOptions {
+  const options: QueueOptions = {
+    connection: { ...connection(settings), ...PRODUCER_CONNECTION_PROFILE },
+    skipMetasUpdate: true,
+    skipVersionCheck: true,
+  };
+  if (settings.prefix !== undefined) options.prefix = settings.prefix;
+  return options;
+}
+
 function workerOptions(settings: DispatchWorkerSettings): WorkerOptions {
   // Worker-level removeOnFail is deliberately absent (record §8 A2): the
   // library then keeps failed jobs, and any value would evict other failed jobs.
@@ -189,31 +255,149 @@ function workerOptions(settings: DispatchWorkerSettings): WorkerOptions {
   return options;
 }
 
+// ---- Task 012B-3: the pinned amendment (B2-7; FD-16, FD-17, FD-19, FD-20) ----
+// The named functions below are the only places the connection, its client
+// and its members are touched; the scan's member-site table pins each site.
+
+/** The client's PING, as the runtime guard narrows it (founder decision PD-A: a named interface). */
+interface PingCapable {
+  ping(): Promise<unknown>;
+}
+
+/** The client's Buffer-returning HMGET, as the runtime guard narrows it (PD-A). */
+interface HashReadCapable {
+  hmgetBuffer(key: string, ...fields: string[]): Promise<unknown>;
+}
+
+/**
+ * The lifetime everReady flag: set on the connection's first `ready`, never
+ * cleared. Attached in the same synchronous sequence that constructs the
+ * Queue, so it cannot miss the first `ready` (run 2 §3.1). The listener
+ * captures only the cell and is never removed.
+ */
+function watchReady(queue: RawQueue): { value: boolean } {
+  const cell = { value: false };
+  queue.getBackend().on("ready", () => {
+    cell.value = true;
+  });
+  return cell;
+}
+
+function isPingClient(value: object): value is PingCapable {
+  return "ping" in value && typeof value.ping === "function";
+}
+
+function isHashClient(value: object): value is HashReadCapable {
+  return "hmgetBuffer" in value && typeof value.hmgetBuffer === "function";
+}
+
+/** The purpose-specific PING (FD-16): resolves with nothing, only on the exact reply PONG. */
+async function pingThrough(queue: RawQueue, active: () => boolean): Promise<void> {
+  const client = await queue.getBackend().client;
+  if (!active()) throw new DispatchQueueError("retired", "the handle is retired");
+  if (!isPingClient(client)) throw new DispatchRedisError("UNCLASSIFIED");
+  const reply = await client.ping();
+  if (!isPongReply(reply)) throw new DispatchRedisError("UNCLASSIFIED");
+}
+
+/**
+ * The one atomic read (FD-17): HMGET of exactly JOB_HASH_FIELDS on the key
+ * derived from the job id. It never parses: the parse runs outside redisCall,
+ * so that JOB_HASH_FORMAT is never reclassified.
+ */
+async function readJobHash(queue: RawQueue, jobId: string, active: () => boolean): Promise<unknown> {
+  const client = await queue.getBackend().client;
+  if (!active()) throw new DispatchQueueError("retired", "the handle is retired");
+  if (!isHashClient(client)) throw new DispatchRedisError("UNCLASSIFIED");
+  return client.hmgetBuffer(queue.toKey(jobId), ...JOB_HASH_FIELDS);
+}
+
+/**
+ * The forced retirement (FD-15(a), FD-20): the forced close is always
+ * initiated first, so no ordinary close can memoize a QUIT; the Queue's own
+ * close() then reuses the connection's memoized forced promise. Both promises
+ * get their rejection handler in this same synchronous body.
+ */
+function retireQueue(queue: RawQueue): Promise<void> {
+  const forced = queue.getBackend().close(true);
+  const closed = queue.close();
+  forced.catch(ignoreRejection);
+  closed.catch(ignoreRejection);
+  return closed;
+}
+
+/** The error listener (B2-6): counts each event's classified code; never throws. */
+function countingListener(onError?: DispatchErrorObserver): (error: Error) => void {
+  if (onError === undefined) return ignoreErrorEvent;
+  return (error: Error): void => {
+    try {
+      onError(classifyRedisError(error));
+    } catch {
+      // The observer's own failure is never allowed to reach the library.
+    }
+  };
+}
+
 /** Each queue handle's publication path, reachable only through publishJob. */
 const publishers = new WeakMap<DispatchQueueHandle, (eventId: string, data: DispatchJobData) => Promise<string>>();
 
-export function openDispatchQueueWith(factories: BullmqFactories, settings: DispatchSettings): DispatchQueueHandle {
+export function openDispatchQueueWith(
+  factories: BullmqFactories,
+  settings: DispatchSettings,
+  onError?: DispatchErrorObserver,
+): DispatchQueueHandle {
   checkConnectionSettings(settings);
   const queue = factories.createQueue(DISPATCH_QUEUE_NAME, queueOptions(settings));
-  queue.on("error", ignoreErrorEvent);
+  queue.on("error", countingListener(onError));
+  const ready = watchReady(queue);
+
+  // The per-handle retirement state (FD-20; RC-8).
+  let retired = false;
+  const active = (): boolean => !retired;
+  const refuseIfRetired = (): void => {
+    if (retired) throw new DispatchQueueError("retired", "the handle is retired");
+  };
+  let retirement: { readonly result: DispatchRetirement; readonly closing: Promise<void> } | undefined;
+  const retireOnce = (): { readonly result: DispatchRetirement; readonly closing: Promise<void> } => {
+    if (retirement === undefined) {
+      const result = Object.freeze({ everReady: ready.value });
+      retired = true;
+      const closing = retireQueue(queue);
+      retirement = { result, closing };
+    }
+    return retirement;
+  };
 
   const handle: DispatchQueueHandle = Object.freeze({
     close: async (): Promise<void> => {
-      await redisCall(() => queue.close());
+      const { closing } = retireOnce();
+      await redisCall(() => closing);
     },
     getJobState: async (jobId: string): Promise<DispatchJobState> => {
+      refuseIfRetired();
       checkEventId(jobId);
       return toJobState(await redisCall(() => queue.getJobState(jobId)));
     },
     getJob: async (jobId: string): Promise<DispatchJobRecord | undefined> => {
+      refuseIfRetired();
       checkEventId(jobId);
       const job = await redisCall(() => queue.getJob(jobId));
-      return job === undefined ? undefined : jobRecord(job);
+      if (job === undefined) return undefined;
+      // Retired while the first read was in flight: no HMGET is initiated.
+      refuseIfRetired();
+      const reply = await redisCall(() => readJobHash(queue, jobId, active));
+      const fields = parseJobHash(reply);
+      return jobRecord(job, fields);
     },
-    getJobCounts: async (): Promise<DispatchJobCounts> => jobCounts(await redisCall(() => queue.getJobCounts())),
+    getJobCounts: async (): Promise<DispatchJobCounts> => {
+      refuseIfRetired();
+      return jobCounts(await redisCall(() => queue.getJobCounts()));
+    },
+    retire: (): DispatchRetirement => retireOnce().result,
   });
 
   publishers.set(handle, async (eventId, data) => {
+    refuseIfRetired();
     const options = dispatchJobOptions(eventId);
     checkJobOptions(options);
     const job = await redisCall(() => queue.add(DISPATCH_JOB_NAME, data, options));
@@ -223,6 +407,50 @@ export function openDispatchQueueWith(factories: BullmqFactories, settings: Disp
     return eventId;
   });
   return handle;
+}
+
+/**
+ * The separate, bounded probe connection (FD-19): a second Queue on the same
+ * name, used for PING only, with the same forced retirement. Its handle is
+ * exactly { close, ping, retire }.
+ */
+export function openDispatchProbeWith(
+  factories: BullmqFactories,
+  settings: DispatchSettings,
+  onError?: DispatchErrorObserver,
+): DispatchProbeHandle {
+  checkConnectionSettings(settings);
+  const queue = factories.createQueue(DISPATCH_QUEUE_NAME, probeOptions(settings));
+  queue.on("error", countingListener(onError));
+  const ready = watchReady(queue);
+
+  let retired = false;
+  const active = (): boolean => !retired;
+  const refuseIfRetired = (): void => {
+    if (retired) throw new DispatchQueueError("retired", "the handle is retired");
+  };
+  let retirement: { readonly result: DispatchRetirement; readonly closing: Promise<void> } | undefined;
+  const retireOnce = (): { readonly result: DispatchRetirement; readonly closing: Promise<void> } => {
+    if (retirement === undefined) {
+      const result = Object.freeze({ everReady: ready.value });
+      retired = true;
+      const closing = retireQueue(queue);
+      retirement = { result, closing };
+    }
+    return retirement;
+  };
+
+  return Object.freeze({
+    close: async (): Promise<void> => {
+      const { closing } = retireOnce();
+      await redisCall(() => closing);
+    },
+    ping: async (): Promise<void> => {
+      refuseIfRetired();
+      await redisCall(() => pingThrough(queue, active));
+    },
+    retire: (): DispatchRetirement => retireOnce().result,
+  });
 }
 
 export async function publishJob(handle: DispatchQueueHandle, eventId: string, data: DispatchJobData): Promise<string> {

@@ -1,5 +1,6 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -171,6 +172,116 @@ describe("no-bypass: planted-violation controls", () => {
       "",
     ].join("\n");
     assert.deepEqual(rules(OTHER_FILE, text), []);
+  });
+});
+
+// ---- Task 012B-3: the pinned amendment (FD-16, FD-19, FD-20; RC-2, RC-6) ----
+
+const ACCESSOR = ["get", "Back", "end"].join("");
+const DEL = ["d", "el"].join("");
+
+/** The pinned member-site multiset of the real implementation file, as `function:member`. */
+const PINNED_MEMBER_SITES = [
+  `watchReady:${ACCESSOR}`,
+  `pingThrough:${ACCESSOR}`,
+  "pingThrough:client",
+  "pingThrough:ping",
+  `readJobHash:${ACCESSOR}`,
+  "readJobHash:client",
+  "readJobHash:toKey",
+  "readJobHash:hmgetBuffer",
+  `retireQueue:${ACCESSOR}`,
+  "retireQueue:close",
+  "retireQueue:close",
+  "isPingClient:ping",
+  "isHashClient:hmgetBuffer",
+  "openDispatchQueueWith:createQueue",
+  "openDispatchProbeWith:createQueue",
+  "startDispatchWorkerWith:createWorker",
+  "startDispatchWorkerWith:close",
+].sort();
+
+function memberSitesOf(sites: readonly { readonly file: string; readonly member: string; readonly function: string }[]): string[] {
+  return sites.map((site) => `${site.function}:${site.member}`).sort();
+}
+
+/** A readJobHash body with one planted client member. */
+function readJobHashWith(member: string): string {
+  return [
+    "async function readJobHash(queue, jobId, active) {",
+    `  const client = await queue.${ACCESSOR}().client;`,
+    `  return client.${member}(queue.toKey(jobId));`,
+    "}",
+    "",
+  ].join("\n");
+}
+
+describe("no-bypass (012B-3): the member-site table, positive control", () => {
+  const scan = scanPackage(PACKAGE_ROOT);
+
+  it("the real package's member sites are exactly the pinned multiset, all in the implementation file", () => {
+    assert.deepEqual(memberSitesOf(scan.memberSites), PINNED_MEMBER_SITES);
+    assert.ok(scan.memberSites.every((site) => site.file === MODULE_FILE));
+  });
+
+  it("control: the planted readJobHash with the permitted member passes", () => {
+    assert.deepEqual(rules(MODULE_FILE, readJobHashWith("hmgetBuffer")), []);
+  });
+});
+
+describe("no-bypass (012B-3): the pinned amendment's planted-violation controls", () => {
+  it("refuses the connection accessor outside its exception files, and any suffixed name everywhere", () => {
+    failsWith("backend-identifier", OTHER_FILE, `const c = queue.${ACCESSOR}();\n`);
+    failsWith("backend-identifier", "src/dispatch-queue/policy.ts", `const c = queue.${ACCESSOR}();\n`);
+    failsWith("backend-identifier", MODULE_FILE, `const ${ACCESSOR}Factory = undefined;\n`);
+    failsWith("backend-identifier", "src/dispatch-queue/policy.test.ts", `const ${ACCESSOR}s = undefined;\n`);
+    assert.deepEqual(rules(MODULE_FILE, `function watchReady(queue) { queue.${ACCESSOR}(); }\n`), []);
+  });
+
+  it("refuses any client member other than the function's set, and a computed member", () => {
+    for (const member of ["hgetall", "call", "sendCommand", DEL]) {
+      failsWith("client-member-not-allowed", MODULE_FILE, readJobHashWith(member));
+    }
+    const computed = [
+      "async function readJobHash(queue, jobId, active) {",
+      `  const client = await queue.${ACCESSOR}().client;`,
+      '  return client["hgetall"](queue.toKey(jobId));',
+      "}",
+      "",
+    ].join("\n");
+    failsWith("client-computed-member", MODULE_FILE, computed);
+    const pingPlant = [
+      "async function pingThrough(queue, active) {",
+      `  const client = await queue.${ACCESSOR}().client;`,
+      "  await client.hmgetBuffer(key);",
+      "}",
+      "",
+    ].join("\n");
+    failsWith("client-member-not-allowed", MODULE_FILE, pingPlant);
+  });
+
+  it("refuses a table member outside its listed functions", () => {
+    failsWith("module-member-site", MODULE_FILE, "function openDispatchQueueWith(factories, settings) { const c = queue.client; }\n");
+    failsWith("module-member-site", MODULE_FILE, `function openDispatchQueueWith(factories, settings) { queue.${ACCESSOR}(); }\n`);
+    failsWith("module-member-site", MODULE_FILE, "function startDispatchWorkerWith(f, s, p) { f.createQueue(name, options); }\n");
+    failsWith("module-member-site", MODULE_FILE, "function openAnother(f) { return f.createQueue(name, options); }\n");
+    // An ordinary close before the forced one.
+    failsWith(
+      "module-member-site",
+      MODULE_FILE,
+      "function openDispatchQueueWith(f, s) { const queue = f.createQueue(name, options); void queue.close(); }\n",
+    );
+  });
+
+  it("a second createQueue inside openDispatchQueueWith changes the member sites, so the positive control fails", () => {
+    const text = readFileSync(join(PACKAGE_ROOT, MODULE_FILE), "utf8");
+    const anchor = "  const ready = watchReady(queue);\n";
+    assert.ok(text.includes(anchor));
+    const planted = text.replace(anchor, `${anchor}  const second = factories.createQueue(DISPATCH_QUEUE_NAME, queueOptions(settings));\n`);
+    assert.notEqual(planted, text);
+    const sites = memberSitesOf(scanSource(MODULE_FILE, planted).memberSites);
+    assert.notDeepEqual(sites, PINNED_MEMBER_SITES);
+    assert.equal(sites.filter((site) => site === "openDispatchQueueWith:createQueue").length, 2);
   });
 });
 

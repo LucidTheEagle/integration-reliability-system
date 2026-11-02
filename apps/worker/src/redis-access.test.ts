@@ -326,7 +326,7 @@ describe("S1-C2: what the issuer seam exposes (redis-guard.ts)", () => {
 /** Every module of the test support and its designed exports. */
 const DESIGNED_EXPORTS: Readonly<Record<string, readonly string[]>> = {
   "dispatch-redis": ["waitUntil"],
-  "handle-surface": ["QUEUE_HANDLE_METHODS", "WORKER_HANDLE_METHODS", "handleSurfaceProblems"],
+  "handle-surface": ["PROBE_HANDLE_METHODS", "QUEUE_HANDLE_METHODS", "WORKER_HANDLE_METHODS", "handleSurfaceProblems"],
   "redis-bootstrap": [],
   "redis-guard": [
     "REGISTERED_TARGET",

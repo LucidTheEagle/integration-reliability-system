@@ -44,11 +44,37 @@ export interface DispatchJobView {
   readonly attemptsMade: number;
 }
 
-/** A job read back through the queue handle: the view plus its stored retention options. */
+/**
+ * A job read back through the queue handle: the view plus its stored retention
+ * options and its fingerprint (Task 012B-3; B2-7, FD-17).
+ *
+ * Sources: `id`, `data`, `removeOnFail` and `removeOnComplete` come from the
+ * library's job read; `attemptsMade`, both times and both digests come from
+ * the one HMGET of the job's hash. [I: the two reads can see different
+ * moments; run 2 §5.3.] An absent field is absent: no own property, never a
+ * property holding undefined. The stored texts themselves never leave the
+ * module.
+ */
 export interface DispatchJobRecord extends DispatchJobView {
   readonly removeOnFail: unknown;
   readonly removeOnComplete: unknown;
+  /** Epoch milliseconds the job was moved to active. */
+  readonly processedOn?: number;
+  /** Epoch milliseconds the job finished. */
+  readonly finishedOn?: number;
+  /** Lower-case hex SHA-256 of the stored return-value bytes. */
+  readonly returnValueSha256?: string;
+  /** Lower-case hex SHA-256 of the stored failure-reason bytes. */
+  readonly failedReasonSha256?: string;
 }
+
+/** What retire() reports: only the generation's lifetime readiness (FD-20). */
+export interface DispatchRetirement {
+  readonly everReady: boolean;
+}
+
+/** Receives the classified code of each queue or probe connection error event (B2-6). */
+export type DispatchErrorObserver = (code: string) => void;
 
 export interface DispatchJobCounts {
   readonly waiting: number;
@@ -62,13 +88,24 @@ export interface DispatchJobCounts {
 
 /**
  * The dispatch queue. Publication goes only through publishDispatchJob; the
- * handle itself offers close() and read-only inspection.
+ * handle itself offers close(), retire() and read-only inspection. close() is
+ * the forced route: it retires the generation (a forced disconnect, never an
+ * awaited QUIT) and awaits the one closing promise (FD-15(a), FD-20).
  */
 export interface DispatchQueueHandle {
   close(): Promise<void>;
   getJobState(jobId: string): Promise<DispatchJobState>;
   getJob(jobId: string): Promise<DispatchJobRecord | undefined>;
   getJobCounts(): Promise<DispatchJobCounts>;
+  /** Synchronous and idempotent: captures everReady, blocks further operations, initiates the forced close. */
+  retire(): DispatchRetirement;
+}
+
+/** The separate, bounded probe connection (FD-19): PING only, the same forced retirement. */
+export interface DispatchProbeHandle {
+  close(): Promise<void>;
+  ping(): Promise<void>;
+  retire(): DispatchRetirement;
 }
 
 export interface DispatchWorkerHandle {

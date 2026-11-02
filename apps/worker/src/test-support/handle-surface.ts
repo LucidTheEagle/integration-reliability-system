@@ -3,7 +3,9 @@
 // its prototype chain up to Object.prototype, and no member holds or is a
 // library or Redis-client object. Problems name a member, never a value.
 
-export const QUEUE_HANDLE_METHODS: readonly string[] = Object.freeze(["close", "getJob", "getJobCounts", "getJobState"]);
+export const QUEUE_HANDLE_METHODS: readonly string[] = Object.freeze(["close", "getJob", "getJobCounts", "getJobState", "retire"]);
+/** The probe connection's handle (Task 012B-3, FD-19; RC-1). */
+export const PROBE_HANDLE_METHODS: readonly string[] = Object.freeze(["close", "ping", "retire"]);
 export const WORKER_HANDLE_METHODS: readonly string[] = Object.freeze(["close", "waitUntilReady"]);
 
 /** Class names of the library's and the Redis client's objects. */

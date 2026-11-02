@@ -100,7 +100,7 @@ export class ConfigValidationError extends Error {
  * one check at once, but the config problem is "this value is
  * wrong," not a list of every reason it's wrong.
  */
-function formatIssues(error: z.ZodError<Env>): string[] {
+function formatIssues<Schema>(error: z.ZodError<Schema>): string[] {
   const messages: string[] = [];
   const reported = new Set<string>();
 
@@ -164,6 +164,78 @@ export function loadConfig(
     }),
     web: Object.freeze({
       port: env.WEB_PORT,
+    }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Worker configuration (Task 012B-3, B2-5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The worker's own variables (B2-5). WORKER_DATABASE_URL is the worker
+ * role's connection string: there is deliberately no fallback to
+ * DATABASE_URL, so the worker can never silently run as the API role. The
+ * Redis password is read by the worker's own loader from the file named by
+ * REDIS_PASSWORD_FILE; this schema checks only that the variable is set.
+ * The API's ports are not required. DATABASE_URL, API_PORT and WEB_PORT are
+ * never read.
+ */
+const workerEnvSchema = z.object({
+  WORKER_DATABASE_URL: z
+    .string()
+    .refine((value) => value.length > 0 && DATABASE_URL_PATTERN.test(value), {
+      message: "must be a non-empty postgres:// or postgresql:// connection string",
+    }),
+  REDIS_HOST: z.string().min(1, "must not be empty"),
+  REDIS_PORT: portSchema,
+  REDIS_PASSWORD_FILE: z.string().min(1, "must not be empty"),
+});
+
+/** Typed, validated configuration of the worker process. */
+export interface WorkerConfig {
+  readonly database: {
+    readonly url: string;
+  };
+  readonly redis: {
+    readonly host: string;
+    readonly port: number;
+    readonly passwordFile: string;
+  };
+}
+
+/**
+ * Validates the worker's environment and returns a deep-frozen
+ * configuration. Issues name the variable, never its value (the same
+ * value-free, first-issue-per-key formatting as loadConfig).
+ *
+ * @throws {ConfigValidationError} if any required value is missing or
+ * invalid; every issue is reported together.
+ */
+export function loadWorkerConfig(
+  source: NodeJS.ProcessEnv = process.env,
+): WorkerConfig {
+  const result = workerEnvSchema.safeParse({
+    WORKER_DATABASE_URL: source.WORKER_DATABASE_URL,
+    REDIS_HOST: source.REDIS_HOST,
+    REDIS_PORT: source.REDIS_PORT,
+    REDIS_PASSWORD_FILE: source.REDIS_PASSWORD_FILE,
+  });
+
+  if (!result.success) {
+    throw new ConfigValidationError(formatIssues(result.error));
+  }
+
+  const env = result.data;
+
+  return Object.freeze({
+    database: Object.freeze({
+      url: env.WORKER_DATABASE_URL,
+    }),
+    redis: Object.freeze({
+      host: env.REDIS_HOST,
+      port: env.REDIS_PORT,
+      passwordFile: env.REDIS_PASSWORD_FILE,
     }),
   });
 }

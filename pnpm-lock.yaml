@@ -41,6 +41,12 @@ importers:
       '@irs/config':
         specifier: workspace:^
         version: link:../../packages/config
+      '@irs/db':
+        specifier: workspace:^
+        version: link:../../packages/db
+      '@irs/domain':
+        specifier: workspace:^
+        version: link:../../packages/domain
       bullmq:
         specifier: 6.4.1
         version: 6.4.1(ioredis@5.11.1)(pg@8.23.1)

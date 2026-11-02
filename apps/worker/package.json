@@ -7,10 +7,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "pnpm run build && node --test \"dist/**/!(*.redis).test.js\"",
-    "test:redis": "pnpm run build && node dist/test-support/redis-suite.js"
+    "test:redis": "pnpm run build && node dist/test-support/redis-suite.js",
+    "start": "node --env-file-if-exists=../../.env dist/main.js"
   },
   "dependencies": {
     "@irs/config": "workspace:^",
+    "@irs/db": "workspace:^",
+    "@irs/domain": "workspace:^",
     "bullmq": "6.4.1",
     "ioredis": "5.11.1"
   }

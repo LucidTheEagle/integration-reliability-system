@@ -71,7 +71,15 @@ describe("dispatch queue (Redis): failed-job retention", () => {
 
       assert.equal(await first.getJobState(failedId), "failed");
       assert.equal(await second.getJobState(failedId), "failed");
-      assert.deepEqual(await first.getJob(failedId), {
+      const record = await first.getJob(failedId);
+      const base = {
+        id: record?.id,
+        data: record?.data,
+        attemptsMade: record?.attemptsMade,
+        removeOnFail: record?.removeOnFail,
+        removeOnComplete: record?.removeOnComplete,
+      };
+      assert.deepEqual(base, {
         id: failedId,
         data: failedData,
         attemptsMade: 1,

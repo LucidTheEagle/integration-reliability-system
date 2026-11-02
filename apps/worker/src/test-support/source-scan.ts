@@ -186,6 +186,8 @@ export interface FileScan {
   readonly violations: readonly Violation[];
   readonly constructions: readonly Construction[];
   readonly libraryImports: readonly LibraryImport[];
+  /** Every member-site table member found in the implementation file, with its enclosing named function ("" if none). */
+  readonly memberSites: readonly { readonly file: string; readonly member: string; readonly function: string }[];
 }
 
 /** The queue library's package name. */
@@ -209,6 +211,47 @@ const FAMILY_WORD = new RegExp(["re", "lay"].join(""), "i");
 const SELECTOR_WORD = new RegExp(["back", "end"].join(""), "i");
 const SELECTOR_KEY = new RegExp(`^${["back", "end"].join("")}(factory)?$`, "i");
 const SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
+
+// Task 012B-3, the pinned amendment (FD-16, FD-19; RC-2, RC-6). The one
+// exception to the selector-word rule: the exact connection accessor, in
+// exactly these three files (the module's implementation, and the
+// encapsulation and policy tests, whose doubles must define it; the third by
+// founder decision F-POLICY-DOUBLE). Every other identifier containing the
+// word stays refused, in every file.
+const CONNECTION_ACCESSOR = ["get", "Back", "end"].join("");
+const CONNECTION_ACCESSOR_FILES: readonly string[] = Object.freeze([
+  "src/dispatch-queue/implementation.ts",
+  "src/dispatch-queue/encapsulation.test.ts",
+  "src/dispatch-queue/policy.test.ts",
+]);
+/** The file the member-site table and the client-function member sets apply to. */
+const MEMBER_SITE_FILE = "src/dispatch-queue/implementation.ts";
+/**
+ * The member-site table: a member token (an identifier after `.`) with one of
+ * these names, outside every one of its listed named functions (the innermost
+ * enclosing `function` declaration), is a `module-member-site` violation.
+ */
+const MEMBER_SITE_TABLE: readonly (readonly [string, readonly string[]])[] = Object.freeze([
+  [CONNECTION_ACCESSOR, ["watchReady", "pingThrough", "readJobHash", "retireQueue"]],
+  ["client", ["pingThrough", "readJobHash"]],
+  ["ping", ["isPingClient", "pingThrough"]],
+  ["hmgetBuffer", ["isHashClient", "readJobHash"]],
+  ["toKey", ["readJobHash"]],
+  ["createQueue", ["openDispatchQueueWith", "openDispatchProbeWith"]],
+  ["createWorker", ["startDispatchWorkerWith"]],
+  ["close", ["retireQueue", "startDispatchWorkerWith"]],
+]);
+/**
+ * The client-function member sets: inside each of these functions every
+ * member token must be in its set (`client-member-not-allowed`), and no `[`
+ * may appear in its body (`client-computed-member`).
+ */
+const CLIENT_FUNCTION_MEMBERS: readonly (readonly [string, readonly string[]])[] = Object.freeze([
+  ["isPingClient", ["ping"]],
+  ["isHashClient", ["hmgetBuffer"]],
+  ["pingThrough", [CONNECTION_ACCESSOR, "client", "ping"]],
+  ["readJobHash", [CONNECTION_ACCESSOR, "client", "toKey", "hmgetBuffer"]],
+]);
 const SPECIFIER_EXTENSION = /\.(d\.ts|ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 
 function isLibrarySpecifier(value: string): boolean {
@@ -409,7 +452,8 @@ export function scanSource(file: string, text: string): FileScan {
   tokens.forEach((token, k) => {
     if (token.kind === "identifier") {
       if (FAMILY_WORD.test(token.value)) report("relay-symbol", token.line);
-      if (SELECTOR_WORD.test(token.value)) report("backend-identifier", token.line);
+      const accessorException = token.value === CONNECTION_ACCESSOR && CONNECTION_ACCESSOR_FILES.includes(file);
+      if (SELECTOR_WORD.test(token.value) && !accessorException) report("backend-identifier", token.line);
     } else if ((token.kind === "string" || token.kind === "template") && SELECTOR_KEY.test(token.value)) {
       report("backend-key", token.line);
     }
@@ -464,7 +508,29 @@ export function scanSource(file: string, text: string): FileScan {
     report("queue-name-literal", line);
   }
 
-  return { violations, constructions, libraryImports };
+  // Task 012B-3: the member-site table and the client-function member sets,
+  // in the implementation file only (FD-16, FD-19, FD-20; RC-2).
+  const memberSites: { file: string; member: string; function: string }[] = [];
+  if (file === MEMBER_SITE_FILE) {
+    const spans = functionSpans(tokens);
+    tokens.forEach((token, k) => {
+      const enclosing = enclosingFunction(spans, k);
+      const member = token.kind === "identifier" && isPunctuator(tokens[k - 1], ".");
+      const allowedIn = member ? MEMBER_SITE_TABLE.find(([name]) => name === token.value)?.[1] : undefined;
+      if (allowedIn !== undefined) {
+        memberSites.push({ file, member: token.value, function: enclosing ?? "" });
+        if (enclosing === undefined || !allowedIn.includes(enclosing)) report("module-member-site", token.line);
+      }
+      const clientMembers =
+        enclosing === undefined ? undefined : CLIENT_FUNCTION_MEMBERS.find(([name]) => name === enclosing)?.[1];
+      if (clientMembers !== undefined) {
+        if (member && !clientMembers.includes(token.value)) report("client-member-not-allowed", token.line);
+        if (isPunctuator(token, "[")) report("client-computed-member", token.line);
+      }
+    });
+  }
+
+  return { violations, constructions, libraryImports, memberSites };
 }
 
 export interface PackageScan extends FileScan {
@@ -502,13 +568,15 @@ export function scanPackage(root: string): PackageScan {
   const violations: Violation[] = links.map((file) => ({ rule: "unscanned-link", file, line: 0 }));
   const constructions: Construction[] = [];
   const libraryImports: LibraryImport[] = [];
+  const memberSites: { file: string; member: string; function: string }[] = [];
   for (const file of files) {
     const scan = scanSource(file, readFileSync(join(root, file), "utf8"));
     violations.push(...scan.violations);
     constructions.push(...scan.constructions);
     libraryImports.push(...scan.libraryImports);
+    memberSites.push(...scan.memberSites);
   }
-  return { files, violations, constructions, libraryImports };
+  return { files, violations, constructions, libraryImports, memberSites };
 }
 
 // ---- Redis client access (012B record Part A2 DF-1) -----------------------

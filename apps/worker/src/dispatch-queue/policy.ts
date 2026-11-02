@@ -4,6 +4,8 @@
 // conflicting value. Plain data only. A refusal names the failed check and
 // never echoes the value.
 
+import { createHash } from "node:crypto";
+
 export const DISPATCH_QUEUE_NAME = "irs-event-dispatch";
 
 /** The name every dispatch job is added under. */
@@ -52,7 +54,8 @@ export type DispatchQueueCheck =
   | "job-remove-on-fail"
   | "job-remove-on-complete"
   | "worker-remove-on-fail"
-  | "worker-remove-on-complete";
+  | "worker-remove-on-complete"
+  | "retired";
 
 export class DispatchQueueError extends Error {
   override readonly name = "DispatchQueueError";
@@ -187,4 +190,93 @@ export function checkJobData(value: unknown): void {
   if (!isPlainObject(value)) {
     throw new DispatchQueueError("job-data", "the job data must be a plain object");
   }
+}
+
+// ---- the job fingerprint read (Task 012B-3: FD-16, FD-17, FD-18 B-2, FD-20; PD-4) ----
+
+/**
+ * The job-hash fields the one atomic read takes, in this order (PD-4). The
+ * key is derived from the job id inside the module; no caller supplies a key
+ * or a field list.
+ */
+export const JOB_HASH_FIELDS = Object.freeze(["atm", "processedOn", "finishedOn", "returnvalue", "failedReason"] as const);
+
+/** The fixed code of a refused job-hash reply (FD-20). */
+export const JOB_HASH_FORMAT = "JOB_HASH_FORMAT";
+
+/** True only for the exact string PONG. */
+export function isPongReply(value: unknown): boolean {
+  return value === "PONG";
+}
+
+function jobHashFormat(): DispatchRedisError {
+  return new DispatchRedisError(JOB_HASH_FORMAT);
+}
+
+/**
+ * A stored decimal number: 1 to 16 ASCII digits in canonical form ("0", or no
+ * leading zero), then a non-negative safe integer. Never JSON.parse, parseInt
+ * or Number alone. A nil field is absent.
+ */
+function storedNumber(value: Buffer | null): number | undefined {
+  if (value === null) return undefined;
+  if (value.length < 1 || value.length > 16) throw jobHashFormat();
+  for (const byte of value) {
+    if (byte < 0x30 || byte > 0x39) throw jobHashFormat();
+  }
+  if (value.length > 1 && value[0] === 0x30) throw jobHashFormat();
+  const parsed = Number(value.toString("latin1"));
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw jobHashFormat();
+  return parsed;
+}
+
+/** SHA-256 of the exact stored bytes, lower-case hex, with no decoding. A nil field is absent. */
+function storedDigest(value: Buffer | null): string | undefined {
+  return value === null ? undefined : createHash("sha256").update(value).digest("hex");
+}
+
+/**
+ * Parses the reply of HMGET <job key> atm processedOn finishedOn returnvalue
+ * failedReason (run 2 §3.5): an array of exactly five elements, each a Buffer
+ * or null. Absent fields are omitted (no property holding undefined); an
+ * absent atm means attemptsMade 0 (the library's own convention). The stored
+ * texts are hashed byte for byte: a completion with no return value stores the
+ * 4 bytes `null`, which are hashed (FD-18 B-2); failedReason is hashed
+ * whichever writer stored it (F-FAILEDREASON-2W). Any other shape or form is
+ * refused with JOB_HASH_FORMAT, which carries no byte, text or number of the
+ * reply.
+ */
+export function parseJobHash(reply: unknown): {
+  attemptsMade: number;
+  processedOn?: number;
+  finishedOn?: number;
+  returnValueSha256?: string;
+  failedReasonSha256?: string;
+} {
+  if (!Array.isArray(reply) || reply.length !== JOB_HASH_FIELDS.length) throw jobHashFormat();
+  const elements: unknown[] = reply;
+  const values: (Buffer | null)[] = [];
+  for (const element of elements) {
+    if (element === null) values.push(null);
+    else if (Buffer.isBuffer(element)) values.push(element);
+    else throw jobHashFormat();
+  }
+  const field = (index: number): Buffer | null => values[index] ?? null;
+  const attempts = storedNumber(field(0));
+  const processedOn = storedNumber(field(1));
+  const finishedOn = storedNumber(field(2));
+  const returnValueSha256 = storedDigest(field(3));
+  const failedReasonSha256 = storedDigest(field(4));
+  const fields: {
+    attemptsMade: number;
+    processedOn?: number;
+    finishedOn?: number;
+    returnValueSha256?: string;
+    failedReasonSha256?: string;
+  } = { attemptsMade: attempts ?? 0 };
+  if (processedOn !== undefined) fields.processedOn = processedOn;
+  if (finishedOn !== undefined) fields.finishedOn = finishedOn;
+  if (returnValueSha256 !== undefined) fields.returnValueSha256 = returnValueSha256;
+  if (failedReasonSha256 !== undefined) fields.failedReasonSha256 = failedReasonSha256;
+  return Object.freeze(fields);
 }
